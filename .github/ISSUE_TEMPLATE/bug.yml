@@ -1,0 +1,25 @@
+name: Bug
+description: Something in the library, the server or the docs does not work as described.
+labels: [bug]
+body:
+  - type: dropdown
+    id: part
+    attributes:
+      label: Part
+      options: [core library, server, docs, a mod using it]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit, and the mod and its version if one is involved

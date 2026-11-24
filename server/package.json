@@ -1,0 +1,17 @@
+{
+  "name": "tiktok-sponsorblock-server",
+  "version": "1.0.0",
+  "private": true,
+  "license": "GPL-3.0-only",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "admin": "node scripts/admin.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250704.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^4.167.0"
+  }
+}

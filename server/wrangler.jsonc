@@ -1,0 +1,52 @@
+{
+  "name": "metra-adskip",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "account_id": "943ad1cd29711dec0741bbab64061011",
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "metra-adskip",
+      "database_id": "c4dc3279-4092-461c-b183-d0fbe7ce0113",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "sponsorblock"
+    }
+  ],
+
+  // Cloudflare Workers Rate Limit bindings: free on Workers Free plan. They only take 10 or 60
+  // second windows, so these stop bursts per address; the daily limits are counted in D1.
+  "unsafe": {
+    "bindings": [
+      {
+        "name": "SUBMIT_LIMITER",
+        "type": "ratelimit",
+        "namespace_id": "1001",
+        "simple": { "limit": 5, "period": 60 }
+      },
+      {
+        "name": "VOTE_LIMITER",
+        "type": "ratelimit",
+        "namespace_id": "1002",
+        "simple": { "limit": 30, "period": 60 }
+      },
+      {
+        "name": "READ_LIMITER",
+        "type": "ratelimit",
+        "namespace_id": "1003",
+        "simple": { "limit": 60, "period": 60 }
+      }
+    ]
+  },
+
+  // Daily rebuild at 01:00 UTC (04:00 Moscow).
+  "triggers": {
+    "crons": ["0 1 * * *"]
+  }
+}

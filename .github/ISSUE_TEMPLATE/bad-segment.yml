@@ -1,0 +1,26 @@
+name: Bad segment
+description: A shared segment skips something that is not an ad, or the wrong part of a video.
+labels: [bad segment]
+body:
+  - type: input
+    id: number
+    attributes:
+      label: Segment number
+      description: The N in adN, shown in the skip notice and in the list of ads.
+      placeholder: ad12
+    validations:
+      required: true
+  - type: input
+    id: video
+    attributes:
+      label: Video link
+      description: A TikTok link where it skipped the wrong thing.
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What went wrong
+      placeholder: It skipped the song, not the ad. / It skipped 5 seconds too long.
+    validations:
+      required: true
