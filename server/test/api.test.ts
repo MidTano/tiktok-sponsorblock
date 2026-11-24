@@ -25,7 +25,9 @@ function landmarks(seed: number, count = 60) {
   const hashes = new Int32Array(count);
   const times = new Int32Array(count);
   for (let i = 0; i < count; i++) {
-    hashes[i] = (seed * 7919 + i * 104729) | 0;
+    const f1 = ((seed * 37 + i * 11) % 400) + 8;
+    const f2 = f1 + (i % 21) - 10;
+    hashes[i] = (f1 << 15) | (f2 << 6) | ((i % 30) + 1);
     times[i] = i;
   }
   return { hashes_b64: base64(hashes.buffer), times_b64: base64(times.buffer) };
@@ -171,6 +173,56 @@ describe('accounts', () => {
     const row = await env.DB.prepare("SELECT source_aid, ip_hash FROM segments WHERE user_id = 'sb:old'")
       .first<{ source_aid: string | null; ip_hash: string | null }>();
     expect(row).toEqual({ source_aid: null, ip_hash: null });
+  });
+});
+
+describe('moderation', () => {
+  it('refuses a print with a landmark the app cannot make', async () => {
+    const hashes = new Int32Array(60).fill((460 << 15) | (460 << 6) | 3);
+    const times = new Int32Array(60).map((_, i) => i);
+    const res = await SELF.fetch('https://base.test/v1/segments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-TT-UID': '1515151515', 'CF-Connecting-IP': '198.51.100.30' },
+      body: JSON.stringify({ name: 'Bad', duration_ms: 2000, frames: 62, hashes_b64: base64(hashes.buffer), times_b64: base64(times.buffer) }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('refuses one landmark repeated across the whole cut', async () => {
+    const hashes = new Int32Array(60).fill((100 << 15) | (100 << 6) | 3);
+    const times = new Int32Array(60).map((_, i) => i);
+    const res = await SELF.fetch('https://base.test/v1/segments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-TT-UID': '1616161616', 'CF-Connecting-IP': '198.51.100.31' },
+      body: JSON.stringify({ name: 'Tone', duration_ms: 2000, frames: 62, hashes_b64: base64(hashes.buffer), times_b64: base64(times.buffer) }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('refuses a vote on your own segment', async () => {
+    const { id } = await (await submit('198.51.100.32', '1717171717', 10)).json<{ id: string }>();
+    expect((await vote('198.51.100.33', '1717171717', id, 1)).status).toBe(409);
+  });
+
+  it('hides a young segment on two down-votes that outnumber up-votes', async () => {
+    const { id } = await (await submit('198.51.100.34', '1818181818', 11)).json<{ id: string }>();
+    await vote('198.51.100.35', '1919191919', id, -1);
+    const second = await vote('198.51.100.36', '2020202020', id, -1);
+    expect(await second.json<{ hidden: number }>()).toMatchObject({ hidden: 1 });
+  });
+
+  it('holds a new segment for review once the account has two hidden ones', async () => {
+    const first = await (await submit('198.51.100.37', '2121212121', 12)).json<{ id: string }>();
+    const second = await (await submit('198.51.100.38', '2121212121', 13)).json<{ id: string }>();
+    await env.DB.prepare('UPDATE segments SET hidden = 1 WHERE id IN (?, ?)').bind(first.id, second.id).run();
+    const held = await submit('198.51.100.39', '2121212121', 14);
+    expect(await held.json<{ pending: boolean }>()).toMatchObject({ pending: true });
+  });
+
+  it('refuses votes on a segment the maintainer removed', async () => {
+    const { id } = await (await submit('198.51.100.41', '2222222222', 16)).json<{ id: string }>();
+    await env.DB.prepare("UPDATE segments SET status = 'removed', hidden = 1 WHERE id = ?").bind(id).run();
+    expect((await vote('198.51.100.42', '2323232323', id, -1)).status).toBe(404);
   });
 });
 

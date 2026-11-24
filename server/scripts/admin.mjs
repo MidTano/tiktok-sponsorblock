@@ -11,11 +11,14 @@
  *   node scripts/admin.mjs unhide <num>
  *   node scripts/admin.mjs ban <num> [reason]   ban who sent ad<num>, hide all they sent
  *   node scripts/admin.mjs unban <num>          lift the ban on who sent ad<num>
+ *   node scripts/admin.mjs pending              segments held for review
+ *   node scripts/admin.mjs approve <num>        release a held segment to every phone
  *   node scripts/admin.mjs export-user <num>    JSON of everything the sender of ad<num> added
  *   node scripts/admin.mjs delete-user <num>    remove everything the sender of ad<num> added
  *   node scripts/admin.mjs stats
  *
- * Changes reach phones at their next sync; the snapshot is rebuilt at the next hourly run.
+ * Hiding and banning remove a segment from every phone at its next sync. The snapshot is rebuilt
+ * at the next hourly run.
  */
 import { execFileSync } from 'node:child_process';
 
@@ -89,7 +92,9 @@ switch (command) {
   case 'hide':
   case 'unhide': {
     const n = number(arg);
-    sql('UPDATE segments SET hidden = ' + (command === 'hide' ? 1 : 0) + ', updated_at = ' + now() + ' WHERE num = ' + n);
+    sql(command === 'hide'
+      ? "UPDATE segments SET hidden = 1, status = 'removed', updated_at = " + now() + ' WHERE num = ' + n
+      : "UPDATE segments SET hidden = 0, status = 'active', updated_at = " + now() + ' WHERE num = ' + n);
     markSnapshotDirty();
     console.log((command === 'hide' ? 'Hid' : 'Restored') + ' ad' + n);
     break;
@@ -101,7 +106,7 @@ switch (command) {
     sql('INSERT OR IGNORE INTO bans (kind, value, reason, created_at) VALUES ' +
       "('user', " + quote(row.user_id) + ', ' + reason + ', ' + now() + ')' +
       (row.ip_hash ? ", ('ip', " + quote(row.ip_hash) + ', ' + reason + ', ' + now() + ')' : ''));
-    sql('UPDATE segments SET hidden = 1, updated_at = ' + now() + ' WHERE user_id = ' + quote(row.user_id) +
+    sql("UPDATE segments SET hidden = 1, status = 'removed', updated_at = " + now() + ' WHERE user_id = ' + quote(row.user_id) +
       (row.ip_hash ? ' OR ip_hash = ' + quote(row.ip_hash) : ''));
     markSnapshotDirty();
     console.log('Banned the sender of ad' + n + ' and hid everything they sent');
@@ -113,6 +118,17 @@ switch (command) {
     sql("DELETE FROM bans WHERE (kind = 'user' AND value = " + quote(row.user_id) + ')' +
       (row.ip_hash ? " OR (kind = 'ip' AND value = " + quote(row.ip_hash) + ')' : ''));
     console.log('Lifted the ban on the sender of ad' + n);
+    break;
+  }
+  case 'pending': {
+    show(sql("SELECT num, name, duration_ms, hash_count, datetime(created_at, 'unixepoch') AS created FROM segments WHERE status = 'pending' ORDER BY num"));
+    break;
+  }
+  case 'approve': {
+    const n = number(arg);
+    sql("UPDATE segments SET status = 'active', updated_at = " + now() + ' WHERE num = ' + n + " AND status = 'pending'");
+    markSnapshotDirty();
+    console.log('Released ad' + n);
     break;
   }
   case 'export-user': {
@@ -145,6 +161,6 @@ switch (command) {
   }
   default:
     console.log('Usage: node scripts/admin.mjs list [--hidden] | show <num> | hide <num> | unhide <num> | ' +
-      'ban <num> [reason] | unban <num> | export-user <num> | delete-user <num> | stats');
+      'ban <num> [reason] | unban <num> | pending | approve <num> | export-user <num> | delete-user <num> | stats');
     process.exitCode = command ? 1 : 0;
 }

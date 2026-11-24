@@ -45,14 +45,22 @@ const MAX_DURATION_MS = 30_000;
 const MAX_NAME_LEN = 80;
 const MIN_HASHES = 40;
 const MAX_HASHES = 6_000;
+/** A landmark value may repeat this often in one segment, and at least this share must differ. */
+const MAX_REPEATS = 40;
+const MIN_DISTINCT_RATIO = 0.3;
 
 /** A segment is hidden once it has this many votes and too many of them are down. */
 const HIDE_MIN_VOTES = 5;
+const FRESH_HIDE_DOWN_VOTES = 2;
+/** An account with this many hidden segments has its new segments held for review. */
+const STRIKES_FOR_REVIEW = 2;
 const HIDE_DOWN_RATIO = 0.4;
 const HIDE_SCORE = -3;
 
 /** Daily limits, counted in D1 over the last 24 hours. */
 const DAY_SECONDS = 86_400;
+/** A segment this young is hidden by two down-votes that outnumber the up-votes. */
+const FRESH_SECONDS = 2 * DAY_SECONDS;
 const SUBMITS_PER_UID_DAY = 20;
 const SUBMITS_PER_IP_DAY = 60;
 const NEW_SEGMENTS_PER_DAY = 300;
@@ -215,7 +223,7 @@ async function handleDelta(req: Request, env: Env): Promise<Response> {
 
   const scan = (await env.DB.prepare(
     `SELECT id, updated_at, 40 + hash_count * 8 AS bytes FROM segments
-     WHERE updated_at >= ? ORDER BY updated_at, id LIMIT ?`,
+     WHERE updated_at >= ? AND status != 'pending' ORDER BY updated_at, id LIMIT ?`,
   ).bind(since, DELTA_SCAN).all<{ id: string; updated_at: number; bytes: number }>()).results ?? [];
 
   let total = 0;
@@ -227,7 +235,7 @@ async function handleDelta(req: Request, env: Env): Promise<Response> {
   const rows = last
     ? (await env.DB.prepare(
         `SELECT id, num, frames, duration_ms, score, hidden, hash_count, hashes, times, updated_at FROM segments
-         WHERE updated_at >= ? AND (updated_at < ? OR (updated_at = ? AND id <= ?))
+         WHERE updated_at >= ? AND status != 'pending' AND (updated_at < ? OR (updated_at = ? AND id <= ?))
          ORDER BY updated_at, id`,
       ).bind(since, last.updated_at, last.updated_at, last.id).all<SegmentRow & { updated_at: number }>()).results ?? []
     : [];
@@ -285,6 +293,12 @@ async function handleSubmit(req: Request, env: Env): Promise<Response> {
     if (same.hidden) return err(409, 'This ad was voted down');
     return json({ id: same.id, num: same.num, duplicate: true }, 200);
   }
+  const badPrint = validatePrint(hashes, times);
+  if (badPrint) return err(400, badPrint);
+
+  const strikes = await env.DB.prepare('SELECT COUNT(*) AS n FROM segments WHERE user_id = ? AND hidden = 1')
+    .bind(user).first<{ n: number }>();
+  const status = (strikes?.n ?? 0) >= STRIKES_FOR_REVIEW ? 'pending' : 'active';
 
   const id = crypto.randomUUID();
   const now = nowSec();
@@ -293,11 +307,11 @@ async function handleSubmit(req: Request, env: Env): Promise<Response> {
       await env.DB.prepare(
         `INSERT INTO segments
            (id, num, user_id, ip_hash, name, duration_ms, source_aid, frames,
-            hash_count, hashes, times, created_at, updated_at)
-         VALUES (?, (SELECT COALESCE(MAX(num), 0) + 1 FROM segments), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            hash_count, hashes, times, status, created_at, updated_at)
+         VALUES (?, (SELECT COALESCE(MAX(num), 0) + 1 FROM segments), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         id, user, netHash, cleanName(body.name), body.duration_ms,
-        body.source_aid ?? null, body.frames, hashCount, hashes, times, now, now,
+        body.source_aid ?? null, body.frames, hashCount, hashes, times, status, now, now,
       ).run();
       break;
     } catch (failure) {
@@ -307,7 +321,7 @@ async function handleSubmit(req: Request, env: Env): Promise<Response> {
   }
 
   const row = await env.DB.prepare('SELECT num FROM segments WHERE id = ?').bind(id).first<{ num: number }>();
-  return json({ id, num: row?.num ?? 0, queued: false }, 201);
+  return json({ id, num: row?.num ?? 0, queued: false, pending: status === 'pending' }, 201);
 }
 
 async function handleVote(req: Request, env: Env, rawId: string): Promise<Response> {
@@ -326,9 +340,10 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
   const body = await readJson<{ vote: number }>(req, MAX_SMALL_BODY);
   if (body.vote !== 1 && body.vote !== -1) return err(400, 'vote must be 1 or -1');
 
-  const segment = await env.DB.prepare('SELECT id FROM segments WHERE id = ? AND hidden = 0')
-    .bind(segmentId).first<{ id: string }>();
+  const segment = await env.DB.prepare("SELECT id, user_id, created_at FROM segments WHERE id = ? AND status = 'active'")
+    .bind(segmentId).first<{ id: string; user_id: string; created_at: number }>();
   if (!segment) return err(404, 'Segment not found');
+  if (segment.user_id === user) return err(409, 'You cannot vote on your own segment');
 
   // One vote per segment per account, and per network too, since an account id is only a claim.
   const fromNetwork = await env.DB.prepare(
@@ -358,7 +373,9 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
   const score = up - down;
   const total = up + down;
   const confirmed = total >= 2 ? 1 : 0;
-  const hidden = total >= HIDE_MIN_VOTES && (score <= HIDE_SCORE || down / total >= HIDE_DOWN_RATIO) ? 1 : 0;
+  const fresh = now - segment.created_at < FRESH_SECONDS;
+  const hidden = (total >= HIDE_MIN_VOTES && (score <= HIDE_SCORE || down / total >= HIDE_DOWN_RATIO))
+    || (fresh && down >= FRESH_HIDE_DOWN_VOTES && down > up) ? 1 : 0;
 
   await env.DB.prepare(
     `UPDATE segments SET score = ?, votes_up = ?, votes_down = ?, confirmed = ?, hidden = ?, updated_at = ?
@@ -471,7 +488,7 @@ async function maintain(env: Env): Promise<void> {
 async function rebuildSnapshot(env: Env): Promise<void> {
   const asOf = nowSec();
   await env.DB.prepare("UPDATE meta SET value = '0' WHERE key = 'snapshot_dirty'").run();
-  const count = (await env.DB.prepare('SELECT COUNT(*) AS n FROM segments WHERE hidden = 0')
+  const count = (await env.DB.prepare("SELECT COUNT(*) AS n FROM segments WHERE hidden = 0 AND status = 'active'")
     .first<{ n: number }>())?.n ?? 0;
   const upload = await env.BUCKET.createMultipartUpload('db.bin', {
     httpMetadata: { contentType: 'application/octet-stream' },
@@ -485,7 +502,7 @@ async function rebuildSnapshot(env: Env): Promise<void> {
     for (;;) {
       const rows = (await env.DB.prepare(
         `SELECT id, num, frames, duration_ms, score, hidden, hash_count, hashes, times FROM segments
-         WHERE hidden = 0 AND num > ? ORDER BY num LIMIT ?`,
+         WHERE hidden = 0 AND status = 'active' AND num > ? ORDER BY num LIMIT ?`,
       ).bind(lastNum, SNAPSHOT_PAGE).all<SegmentRow>()).results ?? [];
       if (rows.length === 0) break;
       for (const row of rows) {
@@ -587,6 +604,35 @@ function validateTimes(times: ArrayBuffer, frames: number, durationMs: number): 
     const t = view.getInt32(i * 4, true);
     if (t < 0 || t > frames + FRAME_SLACK) return 'Landmark time outside the cut';
   }
+  return null;
+}
+
+/** A print the app's own fingerprinting could make: valid pairs, in time order, not flooding one second or repeating one value. */
+function validatePrint(hashes: ArrayBuffer, times: ArrayBuffer): string | null {
+  const hashView = new DataView(hashes);
+  const timeView = new DataView(times);
+  const count = hashes.byteLength / 4;
+  const repeats = new Map<number, number>();
+  const perSecond = new Map<number, number>();
+  let previous = -1;
+  for (let i = 0; i < count; i++) {
+    const hash = hashView.getInt32(i * 4, true);
+    const t = timeView.getInt32(i * 4, true);
+    const f1 = hash >>> 15;
+    const f2 = (hash >>> 6) & 511;
+    const dt = hash & 63;
+    if (dt === 0 || f1 >= 448 || f2 >= 448 || Math.abs(f1 - f2) > 120) return 'A landmark is not one the app makes';
+    if (t < previous) return 'Landmark times go backwards';
+    previous = t;
+    const repeated = (repeats.get(hash) ?? 0) + 1;
+    repeats.set(hash, repeated);
+    if (repeated > MAX_REPEATS) return 'One landmark repeats too often';
+    const second = Math.floor(t / FRAMES_PER_SECOND);
+    const landed = (perSecond.get(second) ?? 0) + 1;
+    perSecond.set(second, landed);
+    if (landed > MAX_HASHES_PER_SECOND) return 'Too many landmarks in one second';
+  }
+  if (repeats.size < count * MIN_DISTINCT_RATIO) return 'Too few different landmarks';
   return null;
 }
 

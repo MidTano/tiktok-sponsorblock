@@ -73,7 +73,7 @@ per segment:
 
 | Reply | Meaning |
 | --- | --- |
-| `201 {"id", "num", "queued": false}` | stored |
+| `201 {"id", "num", "queued": false, "pending"}` | stored; `pending: true` means it is held for a maintainer and reaches phones only once approved |
 | `200 {"id", "num", "duplicate": true}` | the same hashes and times were already sent, by anyone |
 | `202 {"queued": true}` | over a limit; keep it and send it another day |
 | `409` | the same sound was already voted down |
@@ -88,7 +88,9 @@ optional.
 
 ### `POST /v1/segments/:id/vote`
 
-`{"vote": 1}` or `{"vote": -1}`. One vote per segment per account, and per network address.
+`{"vote": 1}` or `{"vote": -1}`. One vote per segment per account, and per network address. A vote on
+your own segment is `409`; a segment that is held or removed is `404`. A segment less than two days old
+is hidden once it has two down-votes and more down-votes than up-votes.
 Sending the other value changes it; sending the same one returns `{"changed": false}`. A vote
 from another account on the same address is `409`. The reply is the new tally:
 `{"score", "votes_up", "votes_down", "confirmed", "hidden"}`. Limits: 30 a minute per address,
