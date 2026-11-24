@@ -75,7 +75,7 @@ per segment:
 | `200 {"id", "num", "duplicate": true}` | the same hashes and times were already sent, by anyone |
 | `202 {"queued": true}` | over a limit; keep it and send it another day |
 | `409` | the same sound was already voted down |
-| `400` | fails validation: 1 to 30 s, 40 to 60,000 hashes, times inside the cut, no more frames and hashes than real landmarks of that length could give |
+| `400` | fails validation: 1 to 30 s, 40 to 6,000 hashes, times inside the cut, no more frames and hashes than real landmarks of that length could give |
 | `403` | banned |
 
 Limits: 5 a minute per address, 20 a day per account, 60 a day per address. `source_aid` is

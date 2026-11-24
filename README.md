@@ -34,9 +34,10 @@ The details are in [docs/how-it-works.md](docs/how-it-works.md).
 
 ## For users
 
-You need a TikTok mod that supports it. The first is the **Skip ads by sound** feature in a
-build of [Metra](https://github.com/icysymmetra/tiktok-patches-for-morphe), TikTok patches for
-[Morphe](https://github.com/MorpheApp). Other mods are welcome to add it; see below.
+You need a TikTok mod that supports it. The first is the **Skip ads by sound** feature in Metra, a fork of
+[icysymmetra/tiktok-patches-for-morphe](https://github.com/icysymmetra/tiktok-patches-for-morphe),
+TikTok patches for [Morphe](https://github.com/MorpheApp). The fork is not published yet, so there
+is no download; the link appears here once it is. Other mods are welcome to add it; see below.
 
 What the feature shows you: marks on the seek bar where an ad sits, a short notice when one is
 skipped with buttons to undo or vote, a list of the ads you marked, and statistics on how many

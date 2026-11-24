@@ -17,7 +17,7 @@ cached snapshot once a day and write rarely.
    `namespace_id` values only need to be unique within your account.
 4. Apply the migrations, in order:
    ```sh
-   for f in migrations/*.sql; do npx wrangler d1 execute <db-name> --remote --file "$f" -y; done
+   npx wrangler d1 migrations apply <db-name> --remote
    ```
 5. Set the address salt, a random value nobody else knows:
    ```sh
@@ -37,7 +37,7 @@ migrations applied with `--local`.
 | Votes | 30 a minute per address, 300 a day per account, 600 a day per address |
 | Downloads | 60 a minute per address |
 | Skip reports | 2 a day per account |
-| A segment | 1 to 30 s, 40 to 60,000 hashes |
+| A segment | 1 to 30 s, 40 to 6,000 hashes |
 
 Per-minute limits use Workers rate-limit bindings, which only take 10 or 60 second windows;
 daily limits are counted in D1.

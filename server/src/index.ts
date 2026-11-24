@@ -1,6 +1,7 @@
 /*
  * Copyright 2026 SponsorBlock for TikTok contributors
  * Built on icysymmetra/tiktok-patches-for-morphe (GPL-3.0).
+ * SPDX-License-Identifier: GPL-3.0-only
  */
 
 /**
@@ -41,7 +42,7 @@ const MIN_DURATION_MS = 1_000;
 const MAX_DURATION_MS = 30_000;
 const MAX_NAME_LEN = 80;
 const MIN_HASHES = 40;
-const MAX_HASHES = 60_000;
+const MAX_HASHES = 6_000;
 
 /** A segment is hidden once it has this many votes and too many of them are down. */
 const HIDE_MIN_VOTES = 5;

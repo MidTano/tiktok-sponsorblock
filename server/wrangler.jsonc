@@ -20,30 +20,13 @@
     }
   ],
 
-  // Cloudflare Workers Rate Limit bindings: free on Workers Free plan. They only take 10 or 60
-  // second windows, so these stop bursts per address; the daily limits are counted in D1.
-  "unsafe": {
-    "bindings": [
-      {
-        "name": "SUBMIT_LIMITER",
-        "type": "ratelimit",
-        "namespace_id": "1001",
-        "simple": { "limit": 5, "period": 60 }
-      },
-      {
-        "name": "VOTE_LIMITER",
-        "type": "ratelimit",
-        "namespace_id": "1002",
-        "simple": { "limit": 30, "period": 60 }
-      },
-      {
-        "name": "READ_LIMITER",
-        "type": "ratelimit",
-        "namespace_id": "1003",
-        "simple": { "limit": 60, "period": 60 }
-      }
-    ]
-  },
+  // Rate Limit bindings are free on the Workers Free plan. They only take 10 or 60 second
+  // windows, so these stop bursts per address; the daily limits are counted in D1.
+  "ratelimits": [
+    { "name": "SUBMIT_LIMITER", "namespace_id": "1001", "simple": { "limit": 5, "period": 60 } },
+    { "name": "VOTE_LIMITER", "namespace_id": "1002", "simple": { "limit": 30, "period": 60 } },
+    { "name": "READ_LIMITER", "namespace_id": "1003", "simple": { "limit": 60, "period": 60 } }
+  ],
 
   // Daily rebuild at 01:00 UTC (04:00 Moscow).
   "triggers": {

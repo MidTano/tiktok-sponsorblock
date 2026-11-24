@@ -10,7 +10,7 @@ Nothing is sent while the shared base is off. With it on:
 | Once a day | for each shared ad skipped on this phone: its id, how many times, how much time it saved | the statistics card |
 | On the statistics card | your TikTok account id | your own totals |
 
-Not sent: audio, video, what you watch, where you are, anything about videos with no ad.
+Not sent: audio, video, where you are, anything about videos with no ad.
 
 Landmarks are a few thousand numbers describing where the loudest points of a sound sit. They
 cannot be turned back into audio.
@@ -20,7 +20,7 @@ address only as a salted SHA-256 hash, used to count daily limits and to stop on
 voting many times under different account ids. The salt is a server secret, not in this
 repository.
 
-The TikTok account id is a public number shown on every profile. It is stored with the
+The TikTok account id is stored with the
 segments and votes you send, so the maintainer can remove everything from one account that
 floods the base.
 

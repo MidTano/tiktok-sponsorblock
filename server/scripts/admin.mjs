@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: GPL-3.0-only
 /**
  * Moderation for the shared ad base. It runs SQL through Wrangler, so whoever is logged in to
  * the Cloudflare account that owns the Worker is the admin; the Worker has no admin route to
