@@ -60,7 +60,7 @@ using the public one is encouraged.
 
 ```sh
 ./gradlew :core:build          # library and its tests (JDK 21 toolchain, Java 11 bytecode)
-cd server && npm install && npm run typecheck
+cd server && npm ci && npm run typecheck && npm test
 ```
 
 ## Contributing

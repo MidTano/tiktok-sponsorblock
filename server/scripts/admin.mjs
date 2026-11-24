@@ -13,13 +13,12 @@
  *   node scripts/admin.mjs unban-uid <uid>
  *   node scripts/admin.mjs stats
  *
- * Hidden segments leave phones at their next daily sync. The snapshot is dropped too, so the
- * next download rebuilds it without them.
+ * Hidden segments leave phones at their next daily sync. The snapshot is marked for a rebuild, so
+ * the next hourly run leaves them out of it.
  */
 import { execFileSync } from 'node:child_process';
 
 const DATABASE = 'metra-adskip';
-const BUCKET = 'sponsorblock';
 
 const WINDOWS = process.platform === 'win32';
 
@@ -38,11 +37,8 @@ function sql(statement) {
   return JSON.parse(out)[0]?.results ?? [];
 }
 
-function dropSnapshot() {
-  execFileSync('npx', ['wrangler', 'r2', 'object', 'delete', BUCKET + '/db.bin', '--remote'], {
-    shell: WINDOWS,
-    stdio: 'inherit',
-  });
+function markSnapshotDirty() {
+  sql("UPDATE meta SET value = '1' WHERE key = 'snapshot_dirty'");
 }
 
 function number(value) {
@@ -78,7 +74,7 @@ switch (command) {
   case 'unhide': {
     const n = number(arg);
     sql('UPDATE segments SET hidden = ' + (command === 'hide' ? 1 : 0) + ', updated_at = ' + now() + ' WHERE num = ' + n);
-    dropSnapshot();
+    markSnapshotDirty();
     console.log((command === 'hide' ? 'Hid' : 'Restored') + ' ad' + n);
     break;
   }
@@ -92,7 +88,7 @@ switch (command) {
       (row.ip_hash ? ", ('ip', " + quote(row.ip_hash) + ', ' + reason + ', ' + now() + ')' : ''));
     sql('UPDATE segments SET hidden = 1, updated_at = ' + now() + ' WHERE tt_uid = ' + quote(row.tt_uid) +
       (row.ip_hash ? ' OR ip_hash = ' + quote(row.ip_hash) : ''));
-    dropSnapshot();
+    markSnapshotDirty();
     console.log('Banned the sender of ad' + n + ' and hid everything they sent');
     break;
   }

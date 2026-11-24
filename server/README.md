@@ -33,7 +33,7 @@ migrations applied with `--local`.
 
 | What | Limit |
 | --- | --- |
-| Submissions | 5 a minute per address, 20 a day per account, 60 a day per address |
+| Submissions | 5 a minute per address, 20 a day per account, 60 a day per address, 300 a day across the base |
 | Votes | 30 a minute per address, 300 a day per account, 600 a day per address |
 | Downloads | 60 a minute per address |
 | Skip reports | 2 a day per account |

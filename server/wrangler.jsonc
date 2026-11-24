@@ -28,8 +28,9 @@
     { "name": "READ_LIMITER", "namespace_id": "1003", "simple": { "limit": 60, "period": 60 } }
   ],
 
-  // Daily rebuild at 01:00 UTC (04:00 Moscow).
+  // Hourly: merge queued skip counts and refresh the stats; the snapshot is rebuilt when a change
+  // flagged it, and every day at 01:00 UTC.
   "triggers": {
-    "crons": ["0 1 * * *"]
+    "crons": ["0 * * * *"]
   }
 }

@@ -10,13 +10,13 @@ only as a salted hash. Errors are JSON: `{"error": "message"}`.
 
 ### `GET /v1/db.bin`
 
-Every visible segment, as a snapshot rebuilt daily at 01:00 UTC and cached for an hour.
+Every visible segment, as a snapshot. It is rebuilt after a change and at 01:00 UTC each day, and cached for an hour. Until the first build the reply is `503` with `Retry-After: 300`.
 `X-Db-Time` is the Unix time the snapshot is current as of. 60 requests a minute per address.
 
 ### `GET /v1/db/since?t=EPOCH`
 
 Every segment changed at or after `t`, hidden ones included with the hidden flag set so phones
-drop them. At most 2,000 rows a page. `X-Db-Time` is the `t` to ask with next, and `X-Db-More: 1`
+drop them. A page holds at most 4 MB of data, about 100 segments at the largest size. `X-Db-Time` is the `t` to ask with next, and `X-Db-More: 1`
 says the page was full and the next one should be fetched now. Rows at the page boundary can
 arrive twice; apply them by id.
 
@@ -77,8 +77,10 @@ per segment:
 | `409` | the same sound was already voted down |
 | `400` | fails validation: 1 to 30 s, 40 to 6,000 hashes, times inside the cut, no more frames and hashes than real landmarks of that length could give |
 | `403` | banned |
+| `413` | body over 256 KB |
+| `415` | body not `application/json` |
 
-Limits: 5 a minute per address, 20 a day per account, 60 a day per address. `source_aid` is
+Limits: 5 a minute per address, 20 a day per account, 60 a day per address, 300 a day across the whole base. An IPv6 client counts as its /64 network. `source_aid` is
 the TikTok video id the ad was cut from, used only by moderators to check a report; it is
 optional.
 
@@ -93,6 +95,6 @@ from another account on the same address is `409`. The reply is the new tally:
 ### `POST /v1/skips`
 
 `{"skips": [{"id": "<uuid>", "n": 3, "ms": 41000}]}`: how many times this phone skipped each
-shared segment since its last report and the time that saved. Twice a day per account. A
+shared segment since its last report and the time that saved. Twice a day per account. The counts reach the segments within the hour; a report covers at most 200 segments. A
 viewer's skips of their own segments are not counted; `n` is capped at 500 and `ms` at `n` times
 the segment's length.
