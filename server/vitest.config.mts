@@ -8,7 +8,7 @@ export default defineConfig(async () => {
     plugins: [
       cloudflareTest({
         wrangler: { configPath: './wrangler.jsonc' },
-        miniflare: { bindings: { TEST_MIGRATIONS: migrations, IP_SALT: 'test-salt' } },
+        miniflare: { bindings: { TEST_MIGRATIONS: migrations, IP_SALT: 'test-salt', USER_SECRET: 'test-user-secret' } },
       }),
     ],
     test: {

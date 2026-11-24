@@ -2,9 +2,11 @@
 
 Base URL of the public instance: `https://metra-adskip.falker600.workers.dev`.
 
-Requests that write carry the TikTok account id of the signed-in viewer in `X-TT-UID` (5 to 30
-digits). It is a claim, not a proof, so every limit is also counted per network address, kept
-only as a salted hash. Errors are JSON: `{"error": "message"}`.
+Requests that write carry a sync token in `X-SB-Token`: 43 URL-safe characters that the phone creates once
+and keeps private. The server stores only a keyed hash of it, so a copy of the database names no
+account. Until 23 January 2027 the old `X-TT-UID` header (the TikTok account id) is still accepted and
+keyed the same way. Every limit is also counted per network address, kept only as a keyed hash;
+an IPv6 client counts as its /64. Errors are JSON: `{"error": "message"}`.
 
 ## Reading
 
@@ -25,7 +27,7 @@ arrive twice; apply them by id.
 `{"total", "active", "contributors", "votes_up", "votes_down", "skips", "saved_ms"}` for the
 whole base.
 
-### `GET /v1/me` (needs `X-TT-UID`)
+### `GET /v1/me` (needs `X-SB-Token`)
 
 `{"segments", "skips", "saved_ms", "votes_up", "votes_down"}`: the caller's visible segments and
 how much they saved other viewers.

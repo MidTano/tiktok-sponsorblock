@@ -14,7 +14,7 @@ three methods.
    cache the result by video id.
 3. **A way in to mark an ad.** Metra adds an item to the share sheet that opens an editor with
    the decoded sound, the video's thumbnails and two handles for the start and end.
-4. **The signed-in account id**, only if the mod writes to the shared base. Reading needs none.
+4. **A sync token**, only if the mod writes to the shared base: 32 random bytes, created once on the phone, kept private and sent as `X-SB-Token`. Reading needs none.
 
 ## The calls
 

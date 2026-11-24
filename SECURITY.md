@@ -10,8 +10,7 @@ that crashes or hangs a phone when parsing a snapshot or matching).
 Expect an answer within a week. Fixes to the public instance are deployed before the details
 are published.
 
-The account id in `X-TT-UID` is a claim the server cannot verify; that is a known limit, and
-the per-address limits and votes exist because of it. Reports that only restate it are not
-vulnerabilities, but ways to get around the per-address checks are.
+A sync token is a claim the server cannot verify. A phone that makes up tokens can vote under them, which is why the per-network limits and the one-vote-per-network rule exist. Reports that only restate it are not
+vulnerabilities, but ways to get around the per-network checks are.
 
 Requests to delete your data from the public base can be sent the same way.

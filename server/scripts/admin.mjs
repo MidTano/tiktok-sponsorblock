@@ -10,11 +10,12 @@
  *   node scripts/admin.mjs hide <num>           take a segment off every phone
  *   node scripts/admin.mjs unhide <num>
  *   node scripts/admin.mjs ban <num> [reason]   ban who sent ad<num>, hide all they sent
- *   node scripts/admin.mjs unban-uid <uid>
+ *   node scripts/admin.mjs unban <num>          lift the ban on who sent ad<num>
+ *   node scripts/admin.mjs export-user <num>    JSON of everything the sender of ad<num> added
+ *   node scripts/admin.mjs delete-user <num>    remove everything the sender of ad<num> added
  *   node scripts/admin.mjs stats
  *
- * Hidden segments leave phones at their next daily sync. The snapshot is marked for a rebuild, so
- * the next hourly run leaves them out of it.
+ * Changes reach phones at their next sync; the snapshot is rebuilt at the next hourly run.
  */
 import { execFileSync } from 'node:child_process';
 
@@ -41,6 +42,15 @@ function markSnapshotDirty() {
   sql("UPDATE meta SET value = '1' WHERE key = 'snapshot_dirty'");
 }
 
+/** Names come from phones; control and format characters are shown as nothing. */
+function printable(value) {
+  return typeof value === 'string' ? value.replace(/[\p{Cc}\p{Cf}]/gu, '') : value;
+}
+
+function show(rows) {
+  console.table(rows.map((row) => Object.fromEntries(Object.entries(row).map(([k, v]) => [k, printable(v)]))));
+}
+
 function number(value) {
   const n = Number(value);
   if (!Number.isInteger(n) || n <= 0) throw new Error('Expected a segment number, like 12 for ad12');
@@ -51,22 +61,28 @@ function quote(text) {
   return "'" + String(text).replace(/'/g, "''") + "'";
 }
 
+function senderOf(n) {
+  const [row] = sql('SELECT user_id, ip_hash FROM segments WHERE num = ' + n);
+  if (!row) throw new Error('No ad' + n);
+  return row;
+}
+
 const now = () => Math.floor(Date.now() / 1000);
 const [command, arg, ...rest] = process.argv.slice(2);
 
 switch (command) {
   case 'list': {
     const where = arg === '--hidden' ? 'WHERE hidden = 1' : '';
-    console.table(sql(
+    show(sql(
       'SELECT num, name, duration_ms, hash_count, score, votes_up, votes_down, skips, hidden, ' +
         "datetime(created_at, 'unixepoch') AS created FROM segments " + where + ' ORDER BY num DESC LIMIT 50'));
     break;
   }
   case 'show': {
     const n = number(arg);
-    console.table(sql('SELECT num, id, tt_uid, name, duration_ms, frames, hash_count, score, votes_up, votes_down, ' +
+    show(sql('SELECT num, id, user_id, name, duration_ms, frames, hash_count, score, votes_up, votes_down, ' +
       'skips, saved_ms, hidden, source_aid FROM segments WHERE num = ' + n));
-    console.table(sql('SELECT v.tt_uid, v.vote, datetime(v.created_at, \'unixepoch\') AS at FROM votes v ' +
+    show(sql('SELECT v.user_id, v.vote, datetime(v.created_at, \'unixepoch\') AS at FROM votes v ' +
       'JOIN segments s ON s.id = v.segment_id WHERE s.num = ' + n));
     break;
   }
@@ -80,31 +96,55 @@ switch (command) {
   }
   case 'ban': {
     const n = number(arg);
-    const [row] = sql('SELECT tt_uid, ip_hash FROM segments WHERE num = ' + n);
-    if (!row) throw new Error('No ad' + n);
+    const row = senderOf(n);
     const reason = quote(rest.join(' ') || 'ad' + n);
     sql('INSERT OR IGNORE INTO bans (kind, value, reason, created_at) VALUES ' +
-      "('uid', " + quote(row.tt_uid) + ', ' + reason + ', ' + now() + ')' +
+      "('user', " + quote(row.user_id) + ', ' + reason + ', ' + now() + ')' +
       (row.ip_hash ? ", ('ip', " + quote(row.ip_hash) + ', ' + reason + ', ' + now() + ')' : ''));
-    sql('UPDATE segments SET hidden = 1, updated_at = ' + now() + ' WHERE tt_uid = ' + quote(row.tt_uid) +
+    sql('UPDATE segments SET hidden = 1, updated_at = ' + now() + ' WHERE user_id = ' + quote(row.user_id) +
       (row.ip_hash ? ' OR ip_hash = ' + quote(row.ip_hash) : ''));
     markSnapshotDirty();
     console.log('Banned the sender of ad' + n + ' and hid everything they sent');
     break;
   }
-  case 'unban-uid': {
-    if (!/^[0-9]{5,30}$/.test(arg ?? '')) throw new Error('Expected a TikTok uid');
-    sql("DELETE FROM bans WHERE kind = 'uid' AND value = " + quote(arg));
-    console.log('Unbanned ' + arg);
+  case 'unban': {
+    const n = number(arg);
+    const row = senderOf(n);
+    sql("DELETE FROM bans WHERE (kind = 'user' AND value = " + quote(row.user_id) + ')' +
+      (row.ip_hash ? " OR (kind = 'ip' AND value = " + quote(row.ip_hash) + ')' : ''));
+    console.log('Lifted the ban on the sender of ad' + n);
     break;
   }
-  case 'stats':
-    console.table(sql('SELECT COUNT(*) AS segments, SUM(hidden) AS hidden, COUNT(DISTINCT tt_uid) AS senders, ' +
-      'SUM(skips) AS skips, SUM(saved_ms) / 3600000.0 AS saved_hours FROM segments'));
-    console.table(sql('SELECT kind, COUNT(*) AS bans FROM bans GROUP BY kind'));
+  case 'export-user': {
+    const row = senderOf(number(arg));
+    const segments = sql('SELECT num, name, duration_ms, frames, hash_count, score, hidden, skips, saved_ms, ' +
+      "datetime(created_at, 'unixepoch') AS created FROM segments WHERE user_id = " + quote(row.user_id));
+    const votes = sql('SELECT s.num, v.vote, datetime(v.created_at, \'unixepoch\') AS at FROM votes v ' +
+      'JOIN segments s ON s.id = v.segment_id WHERE v.user_id = ' + quote(row.user_id));
+    console.log(JSON.stringify({ segments: segments.map((s) => ({ ...s, name: printable(s.name) })), votes }, null, 2));
     break;
+  }
+  case 'delete-user': {
+    const n = number(arg);
+    const row = senderOf(n);
+    const user = quote(row.user_id);
+    const owned = 'SELECT id FROM segments WHERE user_id = ' + user;
+    sql('DELETE FROM skip_inbox WHERE segment_id IN (' + owned + ')');
+    sql('DELETE FROM votes WHERE segment_id IN (' + owned + ') OR user_id = ' + user);
+    sql('DELETE FROM skip_reports WHERE user_id = ' + user);
+    sql('DELETE FROM segments WHERE user_id = ' + user);
+    markSnapshotDirty();
+    console.log('Deleted everything the sender of ad' + n + ' added');
+    break;
+  }
+  case 'stats': {
+    show(sql('SELECT COUNT(*) AS segments, SUM(hidden) AS hidden, COUNT(DISTINCT user_id) AS senders, ' +
+      'SUM(skips) AS skips, SUM(saved_ms) / 3600000.0 AS saved_hours FROM segments'));
+    show(sql('SELECT kind, COUNT(*) AS bans FROM bans GROUP BY kind'));
+    break;
+  }
   default:
     console.log('Usage: node scripts/admin.mjs list [--hidden] | show <num> | hide <num> | unhide <num> | ' +
-      'ban <num> [reason] | unban-uid <uid> | stats');
+      'ban <num> [reason] | unban <num> | export-user <num> | delete-user <num> | stats');
     process.exitCode = command ? 1 : 0;
 }

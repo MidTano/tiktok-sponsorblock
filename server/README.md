@@ -19,11 +19,13 @@ cached snapshot once a day and write rarely.
    ```sh
    npx wrangler d1 migrations apply <db-name> --remote
    ```
-5. Set the address salt, a random value nobody else knows:
+5. Set the two secrets, random values nobody else knows:
    ```sh
    node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))" | npx wrangler secret put IP_SALT
+   node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))" | npx wrangler secret put USER_SECRET
    ```
-   Changing it later only resets the daily counters and per-address vote checks.
+   `IP_SALT` keys the network hashes; changing it only resets the daily counters and per-network vote checks.
+   `USER_SECRET` keys the account hashes; changing it makes every account new.
 6. `npx wrangler deploy`.
 
 For local development, `npx wrangler dev` with a `.dev.vars` file holding `IP_SALT=...`, and the
@@ -54,7 +56,9 @@ node scripts/admin.mjs show 12             # ad12 and its votes
 node scripts/admin.mjs hide 12             # off every phone at the next sync
 node scripts/admin.mjs unhide 12
 node scripts/admin.mjs ban 12 "spam"       # ban whoever sent ad12, hide all they sent
-node scripts/admin.mjs unban-uid <uid>
+node scripts/admin.mjs unban 12
+node scripts/admin.mjs export-user 12     # everything the sender of ad12 added, as JSON
+node scripts/admin.mjs delete-user 12
 node scripts/admin.mjs stats
 ```
 

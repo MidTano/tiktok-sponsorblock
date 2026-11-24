@@ -97,12 +97,80 @@ describe('request limits', () => {
     const batch = [];
     for (let i = 0; i < 300; i++) {
       batch.push(env.DB.prepare(
-        'INSERT INTO segments (id, num, tt_uid, name, duration_ms, frames, hash_count, hashes, times, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO segments (id, num, user_id, name, duration_ms, frames, hash_count, hashes, times, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       ).bind(crypto.randomUUID(), 1000 + i, 'seed' + i, 'seed', 2000, 62, 0, new ArrayBuffer(0), new ArrayBuffer(0), Math.floor(Date.now() / 1000), 0));
     }
     await env.DB.batch(batch);
     const res = await submit('198.51.100.3', '4444444444', 3);
     expect(res.status).toBe(202);
+  });
+});
+
+describe('accounts', () => {
+  it('refuses a request with neither a token nor a legacy uid', async () => {
+    const res = await SELF.fetch('https://base.test/v1/me', { headers: { 'CF-Connecting-IP': '198.51.100.20' } });
+    expect(res.status).toBe(401);
+  });
+
+  it('refuses a malformed sync token', async () => {
+    const res = await SELF.fetch('https://base.test/v1/me', {
+      headers: { 'X-SB-Token': 'short', 'CF-Connecting-IP': '198.51.100.21' },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('stores a keyed account hash and never the legacy uid', async () => {
+    const res = await submit('198.51.100.22', '1212121212', 7);
+    const { id } = await res.json<{ id: string }>();
+    const row = await env.DB.prepare('SELECT user_id FROM segments WHERE id = ?').bind(id).first<{ user_id: string }>();
+    expect(row?.user_id.startsWith('tt:')).toBe(true);
+    expect(row?.user_id).not.toContain('1212121212');
+  });
+
+  it('answers /v1/me for a sync token', async () => {
+    const token = 'A'.repeat(43);
+    const created = await SELF.fetch('https://base.test/v1/segments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-SB-Token': token, 'CF-Connecting-IP': '198.51.100.23' },
+      body: JSON.stringify({ name: 'Token ad', duration_ms: 2000, frames: 62, ...landmarks(8) }),
+    });
+    expect(created.status).toBe(201);
+    const me = await SELF.fetch('https://base.test/v1/me', {
+      headers: { 'X-SB-Token': token, 'CF-Connecting-IP': '198.51.100.24' },
+    });
+    expect(me.status).toBe(200);
+    expect(await me.json<{ segments: number }>()).toMatchObject({ segments: 1 });
+  });
+
+  it('removes control characters from a name and refuses one left empty', async () => {
+    const body = (name: string) => JSON.stringify({ name, duration_ms: 2000, frames: 62, ...landmarks(9) });
+    const cleaned = await SELF.fetch('https://base.test/v1/segments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-TT-UID': '1313131313', 'CF-Connecting-IP': '198.51.100.25' },
+      body: body('A\u0007d\u202E \u200D'),
+    });
+    const { id } = await cleaned.json<{ id: string }>();
+    const row = await env.DB.prepare('SELECT name FROM segments WHERE id = ?').bind(id).first<{ name: string }>();
+    expect(row?.name).toBe('Ad \u200D');
+    expect(row?.name).not.toMatch(/[\u0007\u202E]/);
+
+    const empty = await SELF.fetch('https://base.test/v1/segments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-TT-UID': '1414141414', 'CF-Connecting-IP': '198.51.100.26' },
+      body: body('\u0007\u202E'),
+    });
+    expect(empty.status).toBe(400);
+  });
+
+  it('clears source ids and addresses older than 30 days', async () => {
+    const old = Math.floor(Date.now() / 1000) - 31 * 86_400;
+    await env.DB.prepare(
+      "INSERT INTO segments (id, num, user_id, ip_hash, name, duration_ms, source_aid, frames, hash_count, hashes, times, created_at, updated_at) VALUES (?, 5000, 'sb:old', 'oldnet', 'Old', 2000, '7300000000000000001', 62, 0, ?, ?, ?, ?)",
+    ).bind(crypto.randomUUID(), new ArrayBuffer(0), new ArrayBuffer(0), old, old).run();
+    await runHourly();
+    const row = await env.DB.prepare("SELECT source_aid, ip_hash FROM segments WHERE user_id = 'sb:old'")
+      .first<{ source_aid: string | null; ip_hash: string | null }>();
+    expect(row).toEqual({ source_aid: null, ip_hash: null });
   });
 });
 
@@ -159,7 +227,7 @@ describe('snapshot', () => {
     const batch = [];
     for (let i = 0; i < 150; i++) {
       batch.push(env.DB.prepare(
-        'INSERT INTO segments (id, num, tt_uid, name, duration_ms, frames, hash_count, hashes, times, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO segments (id, num, user_id, name, duration_ms, frames, hash_count, hashes, times, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       ).bind(crypto.randomUUID(), 2000 + i, 'bulk', 'bulk', 2000, 62, 5000, new ArrayBuffer(20000), new ArrayBuffer(20000), 1000 + i, 1000 + i));
     }
     await env.DB.batch(batch);

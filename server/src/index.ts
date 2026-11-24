@@ -8,15 +8,15 @@
  * SponsorBlock for TikTok: the shared ad base.
  *
  * Phones send the audio landmarks of ads they cut, vote on each other's cuts, download the
- * whole base once a day and report how often they skipped each ad. Nothing here can identify
- * a viewer beyond the TikTok account id a phone sends with its writes, and addresses are kept
- * only as salted hashes for the daily limits.
+ * whole base once a day and report how often they skipped each ad. A phone identifies itself
+ * with a random sync token; the base keeps only a keyed hash of it, never the token. Addresses
+ * are kept only as keyed hashes for the daily limits.
  *
  * Routes:
  *   GET  /v1/health                 liveness
  *   GET  /v1/stats                  totals for the whole base
- *   GET  /v1/me                     the calling account's segments and what they saved others
- *   GET  /v1/db.bin                 every visible segment, built hourly into R2 when due
+ *   GET  /v1/me                     the caller's segments and what they saved others
+ *   GET  /v1/db.bin                 every visible segment, built into R2 when due
  *   GET  /v1/db/since?t=EPOCH       segments changed since then, hidden ones flagged
  *   POST /v1/segments               a new segment
  *   POST /v1/segments/:id/vote      +1 or -1, one per account and per network
@@ -36,6 +36,8 @@ export interface Env {
    * the addresses back.
    */
   IP_SALT: string;
+  /** Keys the account hashes, so a copy of the database does not name any TikTok account. */
+  USER_SECRET: string;
 }
 
 const MIN_DURATION_MS = 1_000;
@@ -70,6 +72,16 @@ const DELTA_BYTES = 4 * 1024 * 1024;
 const SNAPSHOT_PART_BYTES = 5 * 1024 * 1024;
 const SNAPSHOT_PAGE = 200;
 
+/** Keeps the source video id and the address hashes for this long, then clears them. */
+const SOURCE_RETENTION_SECONDS = 30 * DAY_SECONDS;
+const REPORT_RETENTION_SECONDS = 3 * DAY_SECONDS;
+
+/**
+ * Until this instant the old X-TT-UID header is still accepted. It is keyed like a token, so the
+ * account id is never stored, and the header stops working after it.
+ */
+const LEGACY_UID_UNTIL = Date.UTC(2027, 0, 23);
+
 /** Landmarks run at 8 kHz with a 256-sample hop and at most 30 peaks a second, 6 pairs each. */
 const FRAMES_PER_SECOND = 8000 / 256;
 const MAX_HASHES_PER_SECOND = 30 * 6;
@@ -80,6 +92,7 @@ const MAGIC = 0x4244414d; // "MADB"
 const VERSION = 2;
 
 const TT_UID_RE = /^[0-9]{5,30}$/;
+const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 type SegmentRow = {
@@ -123,7 +136,7 @@ export default {
     }
   },
 
-  /** Merges queued skip counts and refreshes the stats, every hour. */
+  /** Merges queued skip counts, refreshes the stats and clears old addresses, every hour. */
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(maintain(env));
   },
@@ -131,6 +144,7 @@ export default {
 
 async function route(req: Request, env: Env): Promise<Response> {
   if (!env.IP_SALT) return err(503, 'Server is not configured: IP_SALT secret is missing');
+  if (!env.USER_SECRET) return err(503, 'Server is not configured: USER_SECRET secret is missing');
   const path = new URL(req.url).pathname.replace(/\/$/, '');
   if (req.method === 'GET') {
     if (path === '/v1/health') return json({ ok: true });
@@ -159,15 +173,14 @@ async function handleStats(req: Request, env: Env): Promise<Response> {
 }
 
 async function handleMe(req: Request, env: Env): Promise<Response> {
-  const uid = accountOf(req);
-  if (!uid) return err(401, 'Provide your TikTok uid in X-TT-UID');
+  const user = await userOf(req, env);
   const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + clientNetwork(req) });
   if (!success) return err(429, 'Too many requests');
   const row = await env.DB.prepare(
     `SELECT COUNT(*) AS segments, SUM(skips) AS skips, SUM(saved_ms) AS saved_ms,
             SUM(votes_up) AS votes_up, SUM(votes_down) AS votes_down
-     FROM segments WHERE tt_uid = ? AND hidden = 0`,
-  ).bind(uid).first<Record<string, number | null>>();
+     FROM segments WHERE user_id = ? AND hidden = 0`,
+  ).bind(user).first<Record<string, number | null>>();
   return json(zeroNulls(row));
 }
 
@@ -230,16 +243,15 @@ async function handleDelta(req: Request, env: Env): Promise<Response> {
 }
 
 async function handleSubmit(req: Request, env: Env): Promise<Response> {
-  const uid = accountOf(req);
-  if (!uid) return err(401, 'Provide your TikTok uid in X-TT-UID');
+  const user = await userOf(req, env);
   const net = clientNetwork(req);
   const netHash = await hashNetwork(env, net);
-  if (await banned(env, uid, netHash)) return err(403, 'Banned');
+  if (await banned(env, user, netHash)) return err(403, 'Banned');
 
   // Over a limit the reply is 202: the phone keeps the segment and sends it another day.
   const { success } = await env.SUBMIT_LIMITER.limit({ key: 'ip:' + net });
   if (!success) return json({ queued: true }, 202);
-  const used = await countsToday(env, 'segments', uid, netHash);
+  const used = await countsToday(env, 'segments', user, netHash);
   if (used.byUid >= SUBMITS_PER_UID_DAY || used.byIp >= SUBMITS_PER_IP_DAY) return json({ queued: true }, 202);
   const day = await env.DB.prepare('SELECT COUNT(*) AS n FROM segments WHERE created_at > ?')
     .bind(nowSec() - DAY_SECONDS).first<{ n: number }>();
@@ -280,11 +292,11 @@ async function handleSubmit(req: Request, env: Env): Promise<Response> {
     try {
       await env.DB.prepare(
         `INSERT INTO segments
-           (id, num, tt_uid, ip_hash, name, duration_ms, source_aid, frames,
+           (id, num, user_id, ip_hash, name, duration_ms, source_aid, frames,
             hash_count, hashes, times, created_at, updated_at)
          VALUES (?, (SELECT COALESCE(MAX(num), 0) + 1 FROM segments), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
-        id, uid, netHash, body.name.trim().slice(0, MAX_NAME_LEN), body.duration_ms,
+        id, user, netHash, cleanName(body.name), body.duration_ms,
         body.source_aid ?? null, body.frames, hashCount, hashes, times, now, now,
       ).run();
       break;
@@ -299,17 +311,16 @@ async function handleSubmit(req: Request, env: Env): Promise<Response> {
 }
 
 async function handleVote(req: Request, env: Env, rawId: string): Promise<Response> {
-  const uid = accountOf(req);
-  if (!uid) return err(401, 'Provide your TikTok uid in X-TT-UID');
+  const user = await userOf(req, env);
   if (!UUID_RE.test(rawId)) return err(400, 'Invalid segment id');
   const segmentId = rawId.toLowerCase();
   const net = clientNetwork(req);
   const netHash = await hashNetwork(env, net);
-  if (await banned(env, uid, netHash)) return err(403, 'Banned');
+  if (await banned(env, user, netHash)) return err(403, 'Banned');
 
   const { success } = await env.VOTE_LIMITER.limit({ key: 'ip:' + net });
   if (!success) return err(429, 'Too many votes, slow down');
-  const used = await countsToday(env, 'votes', uid, netHash);
+  const used = await countsToday(env, 'votes', user, netHash);
   if (used.byUid >= VOTES_PER_UID_DAY || used.byIp >= VOTES_PER_IP_DAY) return err(429, 'Too many votes today');
 
   const body = await readJson<{ vote: number }>(req, MAX_SMALL_BODY);
@@ -321,20 +332,20 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
 
   // One vote per segment per account, and per network too, since an account id is only a claim.
   const fromNetwork = await env.DB.prepare(
-    'SELECT 1 AS found FROM votes WHERE segment_id = ? AND ip_hash = ? AND tt_uid != ? LIMIT 1',
-  ).bind(segmentId, netHash, uid).first<{ found: number }>();
+    'SELECT 1 AS found FROM votes WHERE segment_id = ? AND ip_hash = ? AND user_id != ? LIMIT 1',
+  ).bind(segmentId, netHash, user).first<{ found: number }>();
   if (fromNetwork) return err(409, 'This segment already has a vote from your network');
 
-  const existing = await env.DB.prepare('SELECT vote FROM votes WHERE segment_id = ? AND tt_uid = ?')
-    .bind(segmentId, uid).first<{ vote: number }>();
+  const existing = await env.DB.prepare('SELECT vote FROM votes WHERE segment_id = ? AND user_id = ?')
+    .bind(segmentId, user).first<{ vote: number }>();
   const now = nowSec();
   if (existing?.vote === body.vote) return json({ changed: false });
   if (existing) {
-    await env.DB.prepare('UPDATE votes SET vote = ?, ip_hash = ? WHERE segment_id = ? AND tt_uid = ?')
-      .bind(body.vote, netHash, segmentId, uid).run();
+    await env.DB.prepare('UPDATE votes SET vote = ?, ip_hash = ? WHERE segment_id = ? AND user_id = ?')
+      .bind(body.vote, netHash, segmentId, user).run();
   } else {
-    await env.DB.prepare('INSERT INTO votes (segment_id, tt_uid, ip_hash, vote, created_at) VALUES (?, ?, ?, ?, ?)')
-      .bind(segmentId, uid, netHash, body.vote, now).run();
+    await env.DB.prepare('INSERT INTO votes (segment_id, user_id, ip_hash, vote, created_at) VALUES (?, ?, ?, ?, ?)')
+      .bind(segmentId, user, netHash, body.vote, now).run();
   }
 
   const tally = await env.DB.prepare(
@@ -363,12 +374,11 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
  * not counted.
  */
 async function handleSkips(req: Request, env: Env): Promise<Response> {
-  const uid = accountOf(req);
-  if (!uid) return err(401, 'Provide your TikTok uid in X-TT-UID');
+  const user = await userOf(req, env);
   const netHash = await hashNetwork(env, clientNetwork(req));
-  if (await banned(env, uid, netHash)) return err(403, 'Banned');
+  if (await banned(env, user, netHash)) return err(403, 'Banned');
 
-  const reports = await countsToday(env, 'skip_reports', uid, netHash);
+  const reports = await countsToday(env, 'skip_reports', user, netHash);
   if (reports.byUid >= REPORTS_PER_DAY || reports.byIp >= REPORTS_PER_DAY * 5) return err(429, 'Already reported today');
 
   const body = await readJson<{ skips: SkipItem[] }>(req, MAX_SMALL_BODY);
@@ -391,11 +401,11 @@ async function handleSkips(req: Request, env: Env): Promise<Response> {
     if (item.n === 0) continue;
     statements.push(env.DB.prepare(
       `INSERT INTO skip_inbox (segment_id, n, ms, created_at)
-       SELECT id, ?, MIN(?, ? * duration_ms), ? FROM segments WHERE id = ? AND tt_uid != ? AND hidden = 0`,
-    ).bind(item.n, item.ms, item.n, now, item.id, uid));
+       SELECT id, ?, MIN(?, ? * duration_ms), ? FROM segments WHERE id = ? AND user_id != ? AND hidden = 0`,
+    ).bind(item.n, item.ms, item.n, now, item.id, user));
   }
-  statements.push(env.DB.prepare('INSERT INTO skip_reports (tt_uid, ip_hash, created_at) VALUES (?, ?, ?)')
-    .bind(uid, netHash, now));
+  statements.push(env.DB.prepare('INSERT INTO skip_reports (user_id, ip_hash, created_at) VALUES (?, ?, ?)')
+    .bind(user, netHash, now));
   await env.DB.batch(statements);
   return json({ ok: true });
 }
@@ -419,7 +429,7 @@ async function refreshStats(env: Env): Promise<Record<string, number>> {
   const row = await env.DB.prepare(
     `SELECT COUNT(*) AS total,
             SUM(CASE WHEN hidden = 0 THEN 1 ELSE 0 END) AS active,
-            COUNT(DISTINCT CASE WHEN hidden = 0 THEN tt_uid END) AS contributors,
+            COUNT(DISTINCT CASE WHEN hidden = 0 THEN user_id END) AS contributors,
             SUM(votes_up) AS votes_up,
             SUM(votes_down) AS votes_down,
             SUM(skips) AS skips,
@@ -433,9 +443,22 @@ async function refreshStats(env: Env): Promise<Record<string, number>> {
   return stats;
 }
 
+/** Clears the source video ids and address hashes that are past their retention. */
+async function clearOldRecords(env: Env): Promise<void> {
+  const now = nowSec();
+  const sourceCutoff = now - SOURCE_RETENTION_SECONDS;
+  await env.DB.batch([
+    env.DB.prepare('UPDATE segments SET source_aid = NULL, ip_hash = NULL WHERE created_at < ? AND (source_aid IS NOT NULL OR ip_hash IS NOT NULL)')
+      .bind(sourceCutoff),
+    env.DB.prepare('UPDATE votes SET ip_hash = NULL WHERE created_at < ? AND ip_hash IS NOT NULL').bind(sourceCutoff),
+    env.DB.prepare('DELETE FROM skip_reports WHERE created_at < ?').bind(now - REPORT_RETENTION_SECONDS),
+  ]);
+}
+
 async function maintain(env: Env): Promise<void> {
   await flushSkipInbox(env);
   await refreshStats(env);
+  await clearOldRecords(env);
   const dirty = await env.DB.prepare("SELECT value FROM meta WHERE key = 'snapshot_dirty'").first<{ value: string }>();
   if (dirty?.value === '1' || new Date().getUTCHours() === 1) await rebuildSnapshot(env);
 }
@@ -533,8 +556,17 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
   return out;
 }
 
+/**
+ * Removes control and format characters, which would hide text or bend the display, and keeps
+ * the name to MAX_NAME_LEN code points, so a surrogate pair is never cut in half.
+ */
+function cleanName(raw: string): string {
+  const text = raw.normalize('NFC').replace(/[\p{Cc}\p{Cf}]/gu, (char) => (char === '\u200D' ? char : ''));
+  return Array.from(text.trim()).slice(0, MAX_NAME_LEN).join('');
+}
+
 function validateSubmit(body: SubmitBody): string | null {
-  if (typeof body?.name !== 'string' || !body.name.trim()) return 'name required';
+  if (typeof body?.name !== 'string' || !cleanName(body.name)) return 'name required';
   if (typeof body.duration_ms !== 'number' || body.duration_ms < MIN_DURATION_MS || body.duration_ms > MAX_DURATION_MS)
     return 'duration_ms must be ' + MIN_DURATION_MS + '-' + MAX_DURATION_MS;
   if (!Number.isInteger(body.frames) || body.frames <= 0) return 'frames must be a positive integer';
@@ -559,21 +591,38 @@ function validateTimes(times: ArrayBuffer, frames: number, durationMs: number): 
 }
 
 /** Rows this account and this network added to a table in the last 24 hours. */
-async function countsToday(env: Env, table: 'segments' | 'votes' | 'skip_reports', uid: string, netHash: string) {
+async function countsToday(env: Env, table: 'segments' | 'votes' | 'skip_reports', user: string, netHash: string) {
   const since = nowSec() - DAY_SECONDS;
   const row = await env.DB.prepare(
-    'SELECT (SELECT COUNT(*) FROM ' + table + ' WHERE tt_uid = ? AND created_at > ?) AS by_uid, ' +
+    'SELECT (SELECT COUNT(*) FROM ' + table + ' WHERE user_id = ? AND created_at > ?) AS by_uid, ' +
       '(SELECT COUNT(*) FROM ' + table + ' WHERE ip_hash = ? AND created_at > ?) AS by_ip',
-  ).bind(uid, since, netHash, since).first<{ by_uid: number; by_ip: number }>();
+  ).bind(user, since, netHash, since).first<{ by_uid: number; by_ip: number }>();
   return { byUid: row?.by_uid ?? 0, byIp: row?.by_ip ?? 0 };
 }
 
 /** Whether the maintainer banned this account or network with scripts/admin.mjs. */
-async function banned(env: Env, uid: string, netHash: string): Promise<boolean> {
+async function banned(env: Env, user: string, netHash: string): Promise<boolean> {
   const row = await env.DB.prepare(
-    "SELECT 1 AS found FROM bans WHERE (kind = 'uid' AND value = ?) OR (kind = 'ip' AND value = ?) LIMIT 1",
-  ).bind(uid, netHash).first<{ found: number }>();
+    "SELECT 1 AS found FROM bans WHERE (kind = 'user' AND value = ?) OR (kind = 'ip' AND value = ?) LIMIT 1",
+  ).bind(user, netHash).first<{ found: number }>();
   return row != null;
+}
+
+/**
+ * The account a request acts for: a keyed hash of the sync token the phone keeps, or until
+ * LEGACY_UID_UNTIL, of the TikTok account id it still sends. Either way only the hash is used.
+ */
+async function userOf(req: Request, env: Env): Promise<string> {
+  const token = req.headers.get('X-SB-Token')?.trim();
+  if (token) {
+    if (!TOKEN_RE.test(token)) throw new HttpError(401, 'The sync token is not valid');
+    return 'sb:' + (await hmacHex(env.USER_SECRET, token)).slice(0, 32);
+  }
+  const uid = req.headers.get('X-TT-UID')?.trim();
+  if (uid && TT_UID_RE.test(uid) && Date.now() < LEGACY_UID_UNTIL) {
+    return 'tt:' + (await hmacHex(env.USER_SECRET, uid)).slice(0, 32);
+  }
+  throw new HttpError(401, 'Provide your sync token in X-SB-Token');
 }
 
 async function readJson<T>(req: Request, limit: number): Promise<T> {
@@ -607,11 +656,6 @@ function zeroNulls(row: Record<string, number | null> | null): Record<string, nu
   return out;
 }
 
-function accountOf(req: Request): string | null {
-  const uid = req.headers.get('X-TT-UID')?.trim();
-  return uid && TT_UID_RE.test(uid) ? uid : null;
-}
-
 /**
  * The network a request comes from: the address of an IPv4 client, or the first 64 bits of an
  * IPv6 one. A household or mobile carrier owns a whole /64, so counting single addresses would
@@ -628,11 +672,15 @@ function clientNetwork(req: Request): string {
 }
 
 async function hashNetwork(env: Env, net: string): Promise<string> {
+  return (await hmacHex(env.IP_SALT, net)).slice(0, 24);
+}
+
+async function hmacHex(secret: string, message: string): Promise<string> {
   const key = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(env.IP_SALT), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+    'raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
   );
-  const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(net));
-  return [...new Uint8Array(mac).slice(0, 12)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  return [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 function uuidToBytes(uuid: string): Uint8Array {
