@@ -188,6 +188,23 @@ describe('moderation', () => {
     expect(res.status).toBe(400);
   });
 
+  it('accepts a dense cut that starts in the middle of a block', async () => {
+    const count = 2 * 180;
+    const hashes = new Int32Array(count);
+    const times = new Int32Array(count);
+    for (let i = 0; i < count; i++) {
+      const f1 = 8 + (i % 400);
+      hashes[i] = (f1 << 15) | ((f1 + (i % 7)) << 6) | ((i % 60) + 1);
+      times[i] = Math.floor((i * 31) / count);
+    }
+    const res = await SELF.fetch('https://base.test/v1/segments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-TT-UID': '1414141414', 'CF-Connecting-IP': '198.51.100.29' },
+      body: JSON.stringify({ name: 'Dense', duration_ms: 2000, frames: 62, hashes_b64: base64(hashes.buffer), times_b64: base64(times.buffer) }),
+    });
+    expect(res.status).toBe(201);
+  });
+
   it('refuses one landmark repeated across the whole cut', async () => {
     const hashes = new Int32Array(60).fill((100 << 15) | (100 << 6) | 3);
     const times = new Int32Array(60).map((_, i) => i);

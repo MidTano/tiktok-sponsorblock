@@ -93,6 +93,11 @@ const LEGACY_UID_UNTIL = Date.UTC(2027, 0, 23);
 /** Landmarks run at 8 kHz with a 256-sample hop and at most 30 peaks a second, 6 pairs each. */
 const FRAMES_PER_SECOND = 8000 / 256;
 const MAX_HASHES_PER_SECOND = 30 * 6;
+/**
+ * The app caps peaks per 31-frame block of the whole video, and a cut starts anywhere inside a
+ * block, so any 31 frames of a cut can hold the hashes of two blocks.
+ */
+const APP_FRAMES_PER_BLOCK = 31;
 const FRAME_SLACK = 70;
 
 const SNAPSHOT_FORMAT = '2';
@@ -627,10 +632,10 @@ function validatePrint(hashes: ArrayBuffer, times: ArrayBuffer): string | null {
     const repeated = (repeats.get(hash) ?? 0) + 1;
     repeats.set(hash, repeated);
     if (repeated > MAX_REPEATS) return 'One landmark repeats too often';
-    const second = Math.floor(t / FRAMES_PER_SECOND);
+    const second = Math.floor(t / APP_FRAMES_PER_BLOCK);
     const landed = (perSecond.get(second) ?? 0) + 1;
     perSecond.set(second, landed);
-    if (landed > MAX_HASHES_PER_SECOND) return 'Too many landmarks in one second';
+    if (landed > 2 * MAX_HASHES_PER_SECOND) return 'Too many landmarks in one second';
   }
   if (repeats.size < count * MIN_DISTINCT_RATIO) return 'Too few different landmarks';
   return null;
