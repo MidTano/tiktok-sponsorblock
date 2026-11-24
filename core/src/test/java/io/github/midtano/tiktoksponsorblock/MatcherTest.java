@@ -6,11 +6,13 @@
 package io.github.midtano.tiktoksponsorblock;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Random;
@@ -172,5 +174,45 @@ public class MatcherTest {
         List<Matcher.Match> matches = Matcher.match(Matcher.Index.build(Collections.singletonList(segment)),
                 full, Matcher.Strictness.STRICT);
         assertFoundAt(matches, 8000, 20000, 100);
+    }
+
+    @Test
+    public void leavesOutAHashRepeatedAcrossTheWholeAd() {
+        int hash = Landmarks.hash(100, 120, 5);
+        int[] hashes = new int[900];
+        int[] times = new int[900];
+        for (int i = 0; i < hashes.length; i++) {
+            hashes[i] = hash;
+            times[i] = i;
+        }
+        Segment tone = new Segment("3", "tone", 29_000, hashes, times, 900);
+        Landmarks.Print steady = new Landmarks.Print(hashes.clone(), times.clone(), hashes.length, 900, 0);
+        Matcher.Index index = Matcher.Index.build(Collections.singletonList(tone));
+        assertTrue(Matcher.match(index, steady, Matcher.Strictness.NORMAL).isEmpty());
+        assertTrue(find(tone, noise(5, 45 * SR, 0.3)).isEmpty());
+    }
+
+    @Test
+    public void findsAnAdHeardInPiecesWithinThreeSeconds() {
+        short[] ad = melody(7, 12, 1.0);
+        short[] video = place(noise(1, 27 * SR, 0.3), ad, 5 * SR);
+        StreamScanner scanner = new StreamScanner(Matcher.Index.build(Collections.singletonList(segment(ad))),
+                Matcher.Strictness.NORMAL);
+        int piece = SR / 50;
+        long foundAtMs = -1;
+        List<Matcher.Match> found = new ArrayList<>();
+        for (int at = 0; at < video.length; at += piece) {
+            int n = Math.min(piece, video.length - at);
+            scanner.feed(Arrays.copyOfRange(video, at, at + n), n);
+            for (Matcher.Match match : scanner.poll()) {
+                if (foundAtMs < 0) foundAtMs = (at + n) * 1000L / SR;
+                found.add(match);
+            }
+        }
+        assertFalse(found.toString(), found.isEmpty());
+        assertTrue("found at " + foundAtMs + " ms", foundAtMs <= 8_000);
+        for (Matcher.Match match : found) {
+            assertTrue(match.toString(), Math.abs(match.startMs - 5_000) <= 300);
+        }
     }
 }

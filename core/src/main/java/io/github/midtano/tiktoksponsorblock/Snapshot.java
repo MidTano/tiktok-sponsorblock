@@ -27,6 +27,16 @@ public final class Snapshot {
     public static final int MAGIC = 0x4244414D;
     public static final int VERSION = 2;
 
+    /** Limits on what a snapshot may hold; anything past them is refused, not parsed. */
+    static final int MAX_SEGMENTS = 50_000;
+    static final int MAX_HASHES = 6_000;
+    static final int MAX_TOTAL_HASHES = 3_000_000;
+    static final int MIN_DURATION_MS = 1_000;
+    static final int MAX_DURATION_MS = 30_000;
+    /** The app cuts at most 30 s, and a landmark may sit this many frames past the cut's end. */
+    static final int TIME_SLACK = 70;
+    static final int MAX_FRAMES = 30 * Landmarks.FRAMES_PER_SECOND + TIME_SLACK;
+
     /** One segment as the base sends it. */
     public static final class Entry {
         /** The uuid, lower case with hyphens. */
@@ -47,7 +57,10 @@ public final class Snapshot {
 
     private Snapshot() {}
 
-    /** Every complete entry in the data; a truncated tail is ignored. */
+    /**
+     * Every complete, valid entry in the data. A truncated tail stops the reading; a record that
+     * breaks the limits is skipped and the rest still read.
+     */
     public static List<Entry> read(byte[] data) {
         List<Entry> entries = new ArrayList<>();
         if (data.length < 12) return entries;
@@ -56,7 +69,8 @@ public final class Snapshot {
         int version = buf.getInt();
         if (version != 1 && version != 2) throw new IllegalArgumentException("Snapshot version " + version);
         int count = buf.getInt();
-        for (int i = 0; i < count; i++) {
+        long totalHashes = 0;
+        for (int i = 0; i < count && entries.size() < MAX_SEGMENTS; i++) {
             if (buf.remaining() < (version == 2 ? 40 : 28)) break;
             byte[] uuid = new byte[16];
             buf.get(uuid);
@@ -67,16 +81,40 @@ public final class Snapshot {
             int score = buf.getInt();
             int n = buf.getInt();
             if (n < 0 || buf.remaining() < n * 8L) break;
+            totalHashes += n;
+            if (totalHashes > MAX_TOTAL_HASHES) break;
+            if (n > MAX_HASHES) {
+                buf.position(buf.position() + n * 8);
+                continue;
+            }
             int[] hashes = new int[n];
             int[] times = new int[n];
             for (int k = 0; k < n; k++) hashes[k] = buf.getInt();
             for (int k = 0; k < n; k++) times[k] = buf.getInt();
-            String id = uuid(uuid);
             if (frames <= 0) frames = Landmarks.msToFrame(durationMs);
+            if (!isValid(number, durationMs, frames, hashes, times)) continue;
+            String id = uuid(uuid);
             entries.add(new Entry(id, number, (flags & 1) != 0, score,
                     new Segment(id, number > 0 ? "ad" + number : "ad", durationMs, hashes, times, frames)));
         }
         return entries;
+    }
+
+    private static boolean isValid(int number, int durationMs, int frames, int[] hashes, int[] times) {
+        if (number < 0 || durationMs < MIN_DURATION_MS || durationMs > MAX_DURATION_MS) return false;
+        if (frames < 1 || frames > MAX_FRAMES) return false;
+        for (int k = 0; k < hashes.length; k++) {
+            if (!isHash(hashes[k]) || times[k] < 0 || times[k] > frames + TIME_SLACK) return false;
+        }
+        return true;
+    }
+
+    /** Two peak bins below the band's width, then a gap of 1 to 63 frames, as {@link Landmarks#hash} packs them. */
+    private static boolean isHash(int hash) {
+        int f1 = hash >>> 15;
+        int f2 = (hash >>> 6) & 511;
+        int dt = hash & 63;
+        return f1 < Landmarks.BINS && f2 < Landmarks.BINS && dt >= 1;
     }
 
     public static byte[] write(List<Entry> entries) {

@@ -36,6 +36,24 @@ Segment ad = Segment.cut(localId, name, print, startMs, endMs);
 // Send ad.hashes, ad.times, ad.frames and ad.durationMs to POST /v1/segments.
 ```
 
+## Sound from the player instead of a download
+
+When the player already decodes the sound, feed its blocks to `StreamScanner` and skip the download:
+
+```java
+StreamScanner scanner = new StreamScanner(index, Matcher.Strictness.NORMAL);
+// From the player's audio hook, for each block of mono 16-bit PCM at 8 kHz:
+scanner.feed(block, length);
+for (Matcher.Match ad : scanner.poll()) {
+    // ad.startMs and ad.endMs count from the first sample fed.
+}
+```
+
+`poll()` matches the last 12 seconds of sound twice a second, so an ad is reported within about three
+seconds of its start. An ad is reported once, and again only when a later find shows it running
+longer, so skip from `startMs` and treat `endMs` as a value that can grow. Times count from the
+first sample fed: a mod that starts feeding mid-video must add the video's offset itself.
+
 ## Behaviour that keeps it trustworthy
 
 - Show the viewer what was skipped and let them undo it with one tap.

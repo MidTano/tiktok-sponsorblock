@@ -8,7 +8,9 @@ package io.github.midtano.tiktoksponsorblock;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Finds marked ads in a video's landmarks the way Shazam finds a song: every hash the two
@@ -44,6 +46,11 @@ public final class Matcher {
 
     /** One second of frames: the slack around the coverage edges. */
     private static final int SECOND = Landmarks.FRAMES_PER_SECOND;
+    /**
+     * A hash that appears more often than this in one ad is a drone or a steady tone, which
+     * matches any sound that holds it, so it is left out of the index.
+     */
+    private static final int MAX_REPEATS = 8;
 
     public static final class Match {
         public final Segment segment;
@@ -90,13 +97,17 @@ public final class Matcher {
             int k = 0;
             for (int s = 0; s < used.size(); s++) {
                 Segment segment = used.get(s);
+                Map<Integer, Integer> repeats = new HashMap<>();
+                for (int hash : segment.hashes) repeats.merge(hash, 1, Integer::sum);
                 for (int i = 0; i < segment.hashes.length; i++) {
+                    int hash = segment.hashes[i];
+                    if (repeats.get(hash) > MAX_REPEATS) continue;
                     int time = Math.min(0xFFFF, segment.times[i]);
-                    entries[k++] = ((long) segment.hashes[i] << 32) | ((long) s << 16) | time;
+                    entries[k++] = ((long) hash << 32) | ((long) s << 16) | time;
                 }
             }
-            Arrays.sort(entries);
-            return new Index(used.toArray(new Segment[0]), entries);
+            Arrays.sort(entries, 0, k);
+            return new Index(used.toArray(new Segment[0]), Arrays.copyOf(entries, k));
         }
 
         public boolean isEmpty() {
