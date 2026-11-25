@@ -89,8 +89,8 @@ optional.
 ### `POST /v1/segments/:id/vote`
 
 `{"vote": 1}` or `{"vote": -1}`, and `{"vote": 0}` takes your vote back. One vote per segment per account, and per network address. A vote on
-your own segment is `409`; a segment that is held or removed is `404`. A segment less than two days old
-is hidden once it has two down-votes and more down-votes than up-votes.
+your own segment is `409`; a segment that is held or removed is `404`. A segment is hidden once its
+score, up-votes minus down-votes, reaches -2.
 Sending the other value changes it; sending the same one returns `{"changed": false}`. A vote
 from another account on the same address is `409`. The reply is the new tally:
 `{"score", "votes_up", "votes_down", "confirmed", "hidden"}`. Limits: 30 a minute per address,
@@ -100,5 +100,5 @@ from another account on the same address is `409`. The reply is the new tally:
 
 `{"skips": [{"id": "<uuid>", "n": 3, "ms": 41000}]}`: how many times this phone skipped each
 shared segment since its last report and the time that saved. Twice a day per account. The counts reach the segments within the hour; a report covers at most 200 segments. A
-viewer's skips of their own segments are not counted; `n` is capped at 500 and `ms` at `n` times
+viewer's skips of their own segments count only towards `/v1/stats`, not towards `/v1/me`; `n` is capped at 500 and `ms` at `n` times
 the segment's length.

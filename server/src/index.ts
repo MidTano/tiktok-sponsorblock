@@ -49,18 +49,13 @@ const MAX_HASHES = 6_000;
 const MAX_REPEATS = 40;
 const MIN_DISTINCT_RATIO = 0.3;
 
-/** A segment is hidden once it has this many votes and too many of them are down. */
-const HIDE_MIN_VOTES = 5;
-const FRESH_HIDE_DOWN_VOTES = 2;
+/** A segment is hidden once up-votes minus down-votes reach this, as in SponsorBlock. */
+const HIDE_SCORE = -2;
 /** An account with this many hidden segments has its new segments held for review. */
 const STRIKES_FOR_REVIEW = 2;
-const HIDE_DOWN_RATIO = 0.4;
-const HIDE_SCORE = -3;
 
 /** Daily limits, counted in D1 over the last 24 hours. */
 const DAY_SECONDS = 86_400;
-/** A segment this young is hidden by two down-votes that outnumber the up-votes. */
-const FRESH_SECONDS = 2 * DAY_SECONDS;
 const SUBMITS_PER_UID_DAY = 20;
 const SUBMITS_PER_IP_DAY = 60;
 const NEW_SEGMENTS_PER_DAY = 300;
@@ -382,9 +377,7 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
   const score = up - down;
   const total = up + down;
   const confirmed = total >= 2 ? 1 : 0;
-  const fresh = now - segment.created_at < FRESH_SECONDS;
-  const hidden = (total >= HIDE_MIN_VOTES && (score <= HIDE_SCORE || down / total >= HIDE_DOWN_RATIO))
-    || (fresh && down >= FRESH_HIDE_DOWN_VOTES && down > up) ? 1 : 0;
+  const hidden = score <= HIDE_SCORE ? 1 : 0;
 
   await env.DB.prepare(
     `UPDATE segments SET score = ?, votes_up = ?, votes_down = ?, confirmed = ?, hidden = ?, updated_at = ?
@@ -396,8 +389,8 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
 
 /**
  * Queues one phone's skip counts. They reach the segments at the next hourly merge, so a report
- * costs one batch instead of one update per segment. A reader's skips of their own segments are
- * not counted.
+ * costs one batch instead of one update per segment. A reader's skips of their own segments
+ * count only towards the base's totals.
  */
 async function handleSkips(req: Request, env: Env): Promise<Response> {
   const user = await userOf(req, env);
@@ -426,9 +419,9 @@ async function handleSkips(req: Request, env: Env): Promise<Response> {
   for (const item of merged.values()) {
     if (item.n === 0) continue;
     statements.push(env.DB.prepare(
-      `INSERT INTO skip_inbox (segment_id, n, ms, created_at)
-       SELECT id, ?, MIN(?, ? * duration_ms), ? FROM segments WHERE id = ? AND user_id != ? AND hidden = 0`,
-    ).bind(item.n, item.ms, item.n, now, item.id, user));
+      `INSERT INTO skip_inbox (segment_id, n, ms, created_at, own)
+       SELECT id, ?, MIN(?, ? * duration_ms), ?, user_id = ? FROM segments WHERE id = ? AND hidden = 0`,
+    ).bind(item.n, item.ms, item.n, now, user, item.id));
   }
   statements.push(env.DB.prepare('INSERT INTO skip_reports (user_id, ip_hash, created_at) VALUES (?, ?, ?)')
     .bind(user, netHash, now));
@@ -443,10 +436,16 @@ async function flushSkipInbox(env: Env): Promise<void> {
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE segments SET
-         skips = skips + (SELECT SUM(n) FROM skip_inbox WHERE skip_inbox.segment_id = segments.id AND skip_inbox.rowid <= ?),
-         saved_ms = saved_ms + (SELECT SUM(ms) FROM skip_inbox WHERE skip_inbox.segment_id = segments.id AND skip_inbox.rowid <= ?)
-       WHERE id IN (SELECT segment_id FROM skip_inbox WHERE rowid <= ?)`,
-    ).bind(top.top, top.top, top.top),
+         skips = skips + (SELECT COALESCE(SUM(n), 0) FROM skip_inbox
+           WHERE skip_inbox.segment_id = segments.id AND skip_inbox.rowid <= ?1 AND own = 0),
+         saved_ms = saved_ms + (SELECT COALESCE(SUM(ms), 0) FROM skip_inbox
+           WHERE skip_inbox.segment_id = segments.id AND skip_inbox.rowid <= ?1 AND own = 0),
+         own_skips = own_skips + (SELECT COALESCE(SUM(n), 0) FROM skip_inbox
+           WHERE skip_inbox.segment_id = segments.id AND skip_inbox.rowid <= ?1 AND own = 1),
+         own_saved_ms = own_saved_ms + (SELECT COALESCE(SUM(ms), 0) FROM skip_inbox
+           WHERE skip_inbox.segment_id = segments.id AND skip_inbox.rowid <= ?1 AND own = 1)
+       WHERE id IN (SELECT segment_id FROM skip_inbox WHERE rowid <= ?1)`,
+    ).bind(top.top),
     env.DB.prepare('DELETE FROM skip_inbox WHERE rowid <= ?').bind(top.top),
   ]);
 }
@@ -458,8 +457,8 @@ async function refreshStats(env: Env): Promise<Record<string, number>> {
             COUNT(DISTINCT CASE WHEN hidden = 0 THEN user_id END) AS contributors,
             SUM(votes_up) AS votes_up,
             SUM(votes_down) AS votes_down,
-            SUM(skips) AS skips,
-            SUM(saved_ms) AS saved_ms
+            SUM(skips + own_skips) AS skips,
+            SUM(saved_ms + own_saved_ms) AS saved_ms
      FROM segments`,
   ).first<Record<string, number | null>>();
   const stats = zeroNulls(row);

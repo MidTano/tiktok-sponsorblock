@@ -280,6 +280,20 @@ describe('skip reports', () => {
     const row = await env.DB.prepare('SELECT skips FROM segments WHERE id = ?').bind(id).first<{ skips: number }>();
     expect(row?.skips).toBe(0);
   });
+
+  it("counts an author's own skips in the base's totals but not in what they saved others", async () => {
+    const { id } = await (await submit('198.51.100.40', '2020202020', 12)).json<{ id: string }>();
+    await skips('198.51.100.41', '2020202020', [{ id, n: 2, ms: 1500 }]);
+    await skips('198.51.100.42', '2121212121', [{ id, n: 1, ms: 1000 }]);
+    await runHourly();
+    const stats = await (await SELF.fetch('https://base.test/v1/stats', { headers: { 'CF-Connecting-IP': '198.51.100.43' } }))
+      .json<{ skips: number; saved_ms: number }>();
+    expect(stats).toMatchObject({ skips: 3, saved_ms: 2500 });
+    const me = await (await SELF.fetch('https://base.test/v1/me', {
+      headers: { 'X-TT-UID': '2020202020', 'CF-Connecting-IP': '198.51.100.44' },
+    })).json<{ skips: number; saved_ms: number }>();
+    expect(me).toMatchObject({ skips: 1, saved_ms: 1000 });
+  });
 });
 
 describe('snapshot', () => {

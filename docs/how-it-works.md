@@ -71,5 +71,5 @@ times are mapped back to the original video.
 
 The server keeps every segment's hashes and times as they were cut. Phones download a binary
 snapshot once a day and then only what changed since; the format is in [api.md](api.md).
-Votes decide what stays: a segment with at least 5 votes is hidden when its score is -3 or
-lower or 40 % of its votes are down. Identical submissions, byte for byte, are one segment.
+Votes decide what stays: as in SponsorBlock, a segment is hidden once its score, up-votes minus
+down-votes, reaches -2. Identical submissions, byte for byte, are one segment.

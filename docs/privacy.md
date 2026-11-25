@@ -7,7 +7,7 @@ Nothing is sent while the shared base is off. With it on:
 | Once a day | a download request, with the time of the last sync | to get new and hidden segments |
 | When you mark an ad | its audio landmarks (32-bit hashes and their times), its length, the name you gave it, the TikTok video id it was cut from, your sync token | so other phones can skip it; the video id lets moderators check a report |
 | When you vote | the segment id, up or down, your sync token | one vote per account |
-| Once a day | for each shared ad skipped on this phone: its id, how many times, how much time it saved | the statistics card |
+| Twice a day | for each shared ad skipped on this phone: its id, how many times, how much time it saved | the statistics card |
 | On the statistics card | your sync token | your own totals |
 
 Not sent: audio, video, where you are, anything about videos with no ad.
