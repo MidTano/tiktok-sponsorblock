@@ -1,6 +1,5 @@
 /*
  * Copyright 2026 SponsorBlock for TikTok contributors
- * Built on icysymmetra/tiktok-patches-for-morphe (GPL-3.0).
  * SPDX-License-Identifier: GPL-3.0-only
  */
 

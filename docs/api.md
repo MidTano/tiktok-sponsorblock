@@ -26,7 +26,7 @@ drop them. A page holds at most 4 MB of data, about 100 segments at the largest 
 says the page was full and the next one should be fetched now. Pass the returned `X-Db-Cursor` UUID as `after` together with `X-Db-Time` as `t`; persist both until the final page. This advances even when many changes share one second. Rows at the page boundary can
 arrive twice; apply them by id. A last page answers as of the start of the current hour, so phones
 ask with whole hours and most of their requests are answered from the cache; rows changed since
-that hour arrive again next time. A continuation conservatively returns its boundary hour on completion; Metra v0.12.2 and later also retain the first partial page's boundary hour until that pagination finishes, to replay concurrent changes behind a UUID cursor.
+that hour arrive again next time. A continuation conservatively returns its boundary hour on completion; A client should also keep the first partial page's boundary hour until that pagination finishes, to replay concurrent changes behind a UUID cursor.
 
 ### `GET /v1/stats`
 
@@ -106,6 +106,6 @@ from another account on the same address is `409`. The reply is the new tally:
 ### `POST /v1/skips`
 
 `{"report_id": "<uuid-v4>", "skips": [{"id": "<uuid>", "n": 3, "ms": 41000}]}`: how many times this phone skipped each
-shared segment since its last report and the time that saved. Metra v0.12.2 and later send one a day; the server accepts two per rolling day so older versions keep working. Counts reach the segments at daily maintenance; a report covers at most 200 segments. A stable optional `report_id` is deduplicated per account for 30 days, including retries after the daily quota. Retry the exact payload/id, never reuse an id for different counts. Metra v0.12.2 and later stop retrying an unanswered report after seven days (local lifetime totals remain). Legacy reports without an id cannot be deduplicated. A
+shared segment since its last report and the time that saved. Send at most one a day; the server accepts two per rolling day so older clients keep working. Counts reach the segments at daily maintenance; a report covers at most 200 segments. A stable optional `report_id` is deduplicated per account for 30 days, including retries after the daily quota. Retry the exact payload/id, never reuse an id for different counts. Stop retrying an unanswered report after seven days, well inside the 30-day receipt window. Legacy reports without an id cannot be deduplicated. A
 viewer's skips of their own segments count only towards `/v1/stats`, not towards `/v1/me`; `n` is capped at 500 and `ms` at `n` times
 the segment's length.

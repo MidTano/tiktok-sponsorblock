@@ -33,9 +33,9 @@ For local development, `npx wrangler dev` with a `.dev.vars` file holding `IP_SA
 
 ## Pointing a mod at your server
 
-The Metra patch has the address in `BASE_URL` near the top of
-`extensions/tiktok/src/main/java/app/morphe/extension/tiktok/adskip/SharedDb.java`. Change it to
-your `https://<name>.<subdomain>.workers.dev` and build the patches again.
+Every mod keeps the server address in its own code; point it at your
+`https://<name>.<subdomain>.workers.dev` and build the mod again. In Metra it is `BASE_URL` near
+the top of `extensions/tiktok/src/main/java/app/morphe/extension/tiktok/adskip/SharedDb.java`.
 
 ## Limits
 
@@ -91,7 +91,7 @@ What keeps a phone cheap:
   daily run adds them to the segments in a single statement.
 - **Daily maintenance**, at 01:00 UTC, merges reports, refreshes totals, clears old records and
   publishes the snapshot. No hourly idle checks.
-- **The phone asks rarely** (Metra v0.12.2 and later): the base once a day, skip counts once a day and only when it
+- **The phone asks rarely** (Metra from v0.12.2): the base once a day, skip counts once a day and only when it
   skipped something, statistics once a day and only when the list is open, in one
   request (`/v1/me` carries the totals). Pending votes send their latest value at daily sync;
   local down-votes and undo apply immediately. A newly marked ad can upload immediately.

@@ -4,12 +4,13 @@ Skip ads inside TikTok videos by their sound. Someone marks an ad once, and ever
 supporting mod skips it in every video where the same sound plays again, even under a voice-over,
 re-encoded, or sped up a little.
 
-This repository holds the parts any TikTok mod can reuse:
+This repository is the shared side that any TikTok mod can plug into. It has no TikTok or mod
+code of its own:
 
-- **[`core/`](core)**: a dependency-free Java 11 library that fingerprints audio, cuts a marked
-  ad out of a video's fingerprint and finds marked ads in new videos.
 - **[`server/`](server)**: the shared ad base, a Cloudflare Worker with D1 and R2 that stores
   marked ads, takes votes and serves the whole base to phones once a day.
+- **[`core/`](core)**: a dependency-free Java 11 library that fingerprints audio, cuts a marked
+  ad out of a video's fingerprint and finds marked ads in new videos.
 - **[`docs/`](docs)**: how the matching works, the HTTP API and the snapshot format, what a mod
   has to hook to support it, and what data leaves the phone.
 
@@ -18,7 +19,7 @@ This repository holds the parts any TikTok mod can reuse:
 
 ## How it works, in short
 
-1. A viewer sees an ad inside a video and opens **Mark ad** from the share sheet.
+1. A viewer sees an ad inside a video and marks it in their mod.
 2. The mod decodes the video's sound, the viewer drags the start and end over it, and the core
    library turns that stretch into audio landmarks: pairs of spectrogram peaks packed into
    32-bit hashes, the way Shazam identifies songs.
@@ -32,51 +33,40 @@ This repository holds the parts any TikTok mod can reuse:
 
 The details are in [docs/how-it-works.md](docs/how-it-works.md).
 
-## How the pieces fit together
+## How a mod uses it
 
-Two repositories make up the project, and they talk only over HTTPS:
-
-- **This one** is the shared side: the server everyone's phones sync with, the matching library
-  and the docs. Nothing in it knows about TikTok's code, and it runs on Cloudflare, not on phones.
-- **[metra-tiktok-sponsorblock](https://github.com/MidTano/metra-tiktok-sponsorblock)** is the
-  phone side: Metra's TikTok patches plus the **Skip ads by sound** patch, installed through
-  Morphe Manager. It hooks TikTok's player and share sheet, holds its own copy of the matching
-  code, and syncs with the server.
+A mod does the phone side: it hooks TikTok's player, decodes the sound, matches it against the
+base and skips. This server only stores the marks, the votes and the counts, and talks to mods
+over HTTPS.
 
 ```mermaid
 flowchart LR
-  subgraph Phone["Phone: TikTok patched with Metra"]
-    Patch["Skip ads by sound<br/>marks, matching, skipping"]
+  subgraph Phone["Phone: TikTok with a supporting mod"]
+    Mod["mod<br/>marks, matching, skipping"]
   end
   subgraph Cloudflare["Cloudflare, free plan"]
     Worker["Worker<br/>server/src/index.ts"]
     D1[("D1<br/>segments, votes, counts")]
     R2[("R2<br/>daily snapshot")]
   end
-  Patch -- "new marks, votes, skip counts" --> Worker
-  Worker -- "the base: snapshot and daily changes" --> Patch
+  Mod -- "new marks, votes, skip counts" --> Worker
+  Worker -- "the base: snapshot and daily changes" --> Mod
   Worker --- D1
   Worker --- R2
 ```
 
-The patch works without the server, with only the viewer's own marks. The server works without
-the patch: any mod that speaks [the API](docs/api.md) can use it, and anyone can run their own
-copy, see [server/README.md](server/README.md).
+A mod still works without the server, with only the viewer's own marks. Any mod that speaks
+[the API](docs/api.md) can use the public base, and anyone can run their own copy, see
+[server/README.md](server/README.md).
 
-## For users
+## Mods that support it
 
-You need a TikTok mod that supports it. The first is the **Skip ads by sound** patch in
-[metra-tiktok-sponsorblock](https://github.com/MidTano/metra-tiktok-sponsorblock), a fork of
-[icysymmetra/tiktok-patches-for-morphe](https://github.com/icysymmetra/tiktok-patches-for-morphe),
-TikTok patches for [Morphe](https://github.com/MorpheApp). Its
-[install guide](https://github.com/MidTano/metra-tiktok-sponsorblock/blob/main/docs/INSTALL.md)
-walks through it. Other mods are welcome to add it; see below.
+| Mod | Where |
+| --- | --- |
+| Metra, **Skip ads by sound** patch | [MidTano/metra-tiktok-sponsorblock](https://github.com/MidTano/metra-tiktok-sponsorblock), installed through Morphe Manager |
 
-What the feature shows you: marks on the seek bar where an ad sits, a short notice when one is
-skipped with buttons to undo or vote, a list of the ads you marked, and statistics on how many
-ads were skipped and how much time that saved you and others.
-
-What it sends is listed in [docs/privacy.md](docs/privacy.md).
+What the viewer gets depends on the mod. What a mod sends to the public base is listed in
+[docs/privacy.md](docs/privacy.md).
 
 ## For mod developers
 
@@ -104,6 +94,4 @@ with the **Bad segment** issue form.
 
 ## License
 
-GPL-3.0, see [LICENSE](LICENSE). Built on
-[icysymmetra/tiktok-patches-for-morphe](https://github.com/icysymmetra/tiktok-patches-for-morphe),
-see [NOTICE.md](NOTICE.md).
+GPL-3.0, see [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
