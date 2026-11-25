@@ -343,7 +343,7 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
   if (used.byUid >= VOTES_PER_UID_DAY || used.byIp >= VOTES_PER_IP_DAY) return err(429, 'Too many votes today');
 
   const body = await readJson<{ vote: number }>(req, MAX_SMALL_BODY);
-  if (body.vote !== 1 && body.vote !== -1) return err(400, 'vote must be 1 or -1');
+  if (body.vote !== 1 && body.vote !== -1 && body.vote !== 0) return err(400, 'vote must be 1, -1, or 0 to take it back');
 
   const segment = await env.DB.prepare("SELECT id, user_id, created_at FROM segments WHERE id = ? AND status = 'active'")
     .bind(segmentId).first<{ id: string; user_id: string; created_at: number }>();
@@ -351,16 +351,20 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
   if (segment.user_id === user) return err(409, 'You cannot vote on your own segment');
 
   // One vote per segment per account, and per network too, since an account id is only a claim.
-  const fromNetwork = await env.DB.prepare(
-    'SELECT 1 AS found FROM votes WHERE segment_id = ? AND ip_hash = ? AND user_id != ? LIMIT 1',
-  ).bind(segmentId, netHash, user).first<{ found: number }>();
-  if (fromNetwork) return err(409, 'This segment already has a vote from your network');
+  if (body.vote !== 0) {
+    const fromNetwork = await env.DB.prepare(
+      'SELECT 1 AS found FROM votes WHERE segment_id = ? AND ip_hash = ? AND user_id != ? LIMIT 1',
+    ).bind(segmentId, netHash, user).first<{ found: number }>();
+    if (fromNetwork) return err(409, 'This segment already has a vote from your network');
+  }
 
   const existing = await env.DB.prepare('SELECT vote FROM votes WHERE segment_id = ? AND user_id = ?')
     .bind(segmentId, user).first<{ vote: number }>();
   const now = nowSec();
-  if (existing?.vote === body.vote) return json({ changed: false });
-  if (existing) {
+  if ((existing?.vote ?? 0) === body.vote) return json({ changed: false });
+  if (body.vote === 0) {
+    await env.DB.prepare('DELETE FROM votes WHERE segment_id = ? AND user_id = ?').bind(segmentId, user).run();
+  } else if (existing) {
     await env.DB.prepare('UPDATE votes SET vote = ?, ip_hash = ? WHERE segment_id = ? AND user_id = ?')
       .bind(body.vote, netHash, segmentId, user).run();
   } else {

@@ -216,6 +216,13 @@ describe('moderation', () => {
     expect(res.status).toBe(400);
   });
 
+  it('takes a vote back with 0', async () => {
+    const { id } = await (await submit('198.51.100.34', '1818181818', 11)).json<{ id: string }>();
+    expect(await (await vote('198.51.100.35', '1919191919', id, -1)).json()).toMatchObject({ votes_down: 1 });
+    expect(await (await vote('198.51.100.35', '1919191919', id, 0)).json()).toMatchObject({ votes_up: 0, votes_down: 0 });
+    expect(await (await vote('198.51.100.35', '1919191919', id, 0)).json()).toMatchObject({ changed: false });
+  });
+
   it('refuses a vote on your own segment', async () => {
     const { id } = await (await submit('198.51.100.32', '1717171717', 10)).json<{ id: string }>();
     expect((await vote('198.51.100.33', '1717171717', id, 1)).status).toBe(409);

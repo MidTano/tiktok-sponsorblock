@@ -88,7 +88,7 @@ optional.
 
 ### `POST /v1/segments/:id/vote`
 
-`{"vote": 1}` or `{"vote": -1}`. One vote per segment per account, and per network address. A vote on
+`{"vote": 1}` or `{"vote": -1}`, and `{"vote": 0}` takes your vote back. One vote per segment per account, and per network address. A vote on
 your own segment is `409`; a segment that is held or removed is `404`. A segment less than two days old
 is hidden once it has two down-votes and more down-votes than up-votes.
 Sending the other value changes it; sending the same one returns `{"changed": false}`. A vote
