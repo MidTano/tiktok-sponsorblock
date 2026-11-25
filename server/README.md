@@ -28,8 +28,14 @@ cached snapshot once a day and write rarely.
    `USER_SECRET` keys the account hashes; changing it makes every account new.
 6. `npx wrangler deploy`.
 
-For local development, `npx wrangler dev` with a `.dev.vars` file holding `IP_SALT=...`, and the
-migrations applied with `--local`.
+For local development, `npx wrangler dev` with a `.dev.vars` file holding `IP_SALT=...` and
+`USER_SECRET=...`, and the migrations applied with `--local`.
+
+## Pointing a mod at your server
+
+The Metra patch has the address in `BASE_URL` near the top of
+`extensions/tiktok/src/main/java/app/morphe/extension/tiktok/adskip/SharedDb.java`. Change it to
+your `https://<name>.<subdomain>.workers.dev` and build the patches again.
 
 ## Limits
 
@@ -64,8 +70,43 @@ node scripts/admin.mjs stats
 
 Edit `DATABASE` and `BUCKET` at the top of the script for your own instance.
 
-## Free plan headroom
+## Staying on the free plan
 
-Workers free: 100,000 requests a day. D1 free: 5 million rows read and 100,000 written a day,
-5 GB stored. R2 free: 10 GB stored, egress free. One phone makes about three requests a day,
-so the public instance serves tens of thousands of daily users before it needs the paid plan.
+The free plan gives, per account and UTC day: 100,000 Worker requests; for D1, 5 million rows read
+and 100,000 rows written (an index on a written column adds a row), with 5 GB stored; for R2,
+10 GB stored, 1 million writes and 10 million reads a month, and no egress fees. Since September
+2026, D1 refuses queries for the rest of the UTC day once a limit is passed; phones then keep
+skipping with what they have and send their counts later.
+
+What keeps a phone cheap:
+
+- **Workers Caching** (`"cache": { "enabled": true }` in `wrangler.jsonc`) answers
+  `/v1/db.bin`, `/v1/db/since` and `/v1/stats` from Cloudflare's cache until a minute past the
+  next hourly run, without running the Worker, so they cost no D1 or R2 reads. A cache hit still
+  counts as a request.
+- **Whole-hour deltas.** A delta answers as of the start of the hour, so every phone asks with one
+  of a few dozen `t` values and most deltas come from the cache.
+- **One row per skip report.** A report keeps its counts as JSON in one `skip_reports` row; the
+  hourly run adds them to the segments in a single statement.
+- **A quiet hourly run.** One query checks what changed. The stats are counted again only after a
+  change, and the retention cleanup and the snapshot run once a day, at 01:00 UTC.
+- **The phone asks rarely**: the base once a day, skip counts at most twice a day and only when it
+  skipped something, statistics at most once an hour and only when the list is open, in one
+  request (`/v1/me` carries the totals).
+
+A rough budget for one daily phone, as an estimate:
+
+| What the phone does | Requests | D1 rows written |
+| --- | --- | --- |
+| Daily sync | 1 | 0 |
+| Skip counts, up to twice a day | 2 | about 3 each, 3 more when cleared after 3 days |
+| Statistics, when the list is opened | 0 to a few | 0 |
+| Marking an ad or voting, now and then | 1 each | about 7 per mark, 6 per vote |
+
+That is about 4 requests and 12 rows written a day, so the free plan carries somewhere around
+8,000 to 20,000 daily users, with rows written running out first. Past that, the Workers Paid
+plan ($5 a month) lifts every limit above by a wide margin.
+
+Watch the numbers under **Workers & Pages → your Worker → Metrics** and **D1 → your database →
+Metrics**. Your own `wrangler d1 execute` and `d1 export` runs count too: an export reads every
+row.

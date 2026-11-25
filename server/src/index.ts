@@ -56,6 +56,7 @@ const STRIKES_FOR_REVIEW = 2;
 
 /** Daily limits, counted in D1 over the last 24 hours. */
 const DAY_SECONDS = 86_400;
+const HOUR_SECONDS = 3_600;
 const SUBMITS_PER_UID_DAY = 20;
 const SUBMITS_PER_IP_DAY = 60;
 const NEW_SEGMENTS_PER_DAY = 300;
@@ -145,8 +146,8 @@ export default {
   },
 
   /** Merges queued skip counts, refreshes the stats and clears old addresses, every hour. */
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(maintain(env));
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(maintain(env, new Date(event.scheduledTime)));
   },
 };
 
@@ -176,7 +177,7 @@ async function handleStats(req: Request, env: Env): Promise<Response> {
   const cached = await env.DB.prepare("SELECT value FROM meta WHERE key = 'stats'").first<{ value: string }>();
   const body = cached ? cached.value : JSON.stringify(await refreshStats(env));
   return new Response(body, {
-    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' },
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': untilNextRun() },
   });
 }
 
@@ -184,12 +185,15 @@ async function handleMe(req: Request, env: Env): Promise<Response> {
   const user = await userOf(req, env);
   const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + clientNetwork(req) });
   if (!success) return err(429, 'Too many requests');
+  // The base's totals ride along, so the statistics card needs one request instead of two.
   const row = await env.DB.prepare(
     `SELECT COUNT(*) AS segments, SUM(skips) AS skips, SUM(saved_ms) AS saved_ms,
-            SUM(votes_up) AS votes_up, SUM(votes_down) AS votes_down
+            SUM(votes_up) AS votes_up, SUM(votes_down) AS votes_down,
+            (SELECT value FROM meta WHERE key = 'stats') AS base
      FROM segments WHERE user_id = ? AND hidden = 0`,
-  ).bind(user).first<Record<string, number | null>>();
-  return json(zeroNulls(row));
+  ).bind(user).first<Record<string, number | null> & { base: string | null }>();
+  const { base, ...mine } = row ?? { base: null };
+  return json({ ...zeroNulls(mine), base: base ? JSON.parse(base) : await refreshStats(env) });
 }
 
 async function handleFullDb(req: Request, env: Env): Promise<Response> {
@@ -203,7 +207,7 @@ async function handleFullDb(req: Request, env: Env): Promise<Response> {
   return new Response(obj.body, {
     headers: {
       'Content-Type': 'application/octet-stream',
-      'Cache-Control': 'public, max-age=3600',
+      'Cache-Control': untilNextRun(),
       'Last-Modified': obj.uploaded.toUTCString(),
       'X-Db-Time': obj.customMetadata?.as_of ?? String(Math.floor(obj.uploaded.getTime() / 1000)),
     },
@@ -240,10 +244,13 @@ async function handleDelta(req: Request, env: Env): Promise<Response> {
       ).bind(since, last.updated_at, last.updated_at, last.id).all<SegmentRow & { updated_at: number }>()).results ?? []
     : [];
 
-  const asOf = more && last ? last.updated_at : nowSec();
+  // Whole hours, so phones ask from the same few times and Workers Caching answers most of them.
+  // A row changed since the hour began is sent again next time, which a phone merges as a no-op.
+  const asOf = more && last ? last.updated_at : hourStart(nowSec());
   return new Response(packRows(rows), {
     headers: {
       'Content-Type': 'application/octet-stream',
+      'Cache-Control': untilNextRun(),
       'X-Db-Time': String(asOf),
       'X-Db-More': more ? '1' : '0',
     },
@@ -388,9 +395,9 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
 }
 
 /**
- * Queues one phone's skip counts. They reach the segments at the next hourly merge, so a report
- * costs one batch instead of one update per segment. A reader's skips of their own segments
- * count only towards the base's totals.
+ * Keeps one phone's skip counts as a single row. They reach the segments at the next hourly
+ * merge, so a report costs a few rows written however many ads it covers. A reader's skips of
+ * their own segments count only towards the base's totals.
  */
 async function handleSkips(req: Request, env: Env): Promise<Response> {
   const user = await userOf(req, env);
@@ -414,39 +421,42 @@ async function handleSkips(req: Request, env: Env): Promise<Response> {
   }
   if (merged.size > MAX_REPORT_IDS) return err(400, 'A report covers at most ' + MAX_REPORT_IDS + ' segments');
 
-  const now = nowSec();
-  const statements: D1PreparedStatement[] = [];
-  for (const item of merged.values()) {
-    if (item.n === 0) continue;
-    statements.push(env.DB.prepare(
-      `INSERT INTO skip_inbox (segment_id, n, ms, created_at, own)
-       SELECT id, ?, MIN(?, ? * duration_ms), ?, user_id = ? FROM segments WHERE id = ? AND hidden = 0`,
-    ).bind(item.n, item.ms, item.n, now, user, item.id));
-  }
-  statements.push(env.DB.prepare('INSERT INTO skip_reports (user_id, ip_hash, created_at) VALUES (?, ?, ?)')
-    .bind(user, netHash, now));
-  await env.DB.batch(statements);
+  const items = [...merged.values()].filter((item) => item.n > 0);
+  await env.DB.prepare('INSERT INTO skip_reports (user_id, ip_hash, created_at, items) VALUES (?, ?, ?, ?)')
+    .bind(user, netHash, nowSec(), JSON.stringify(items)).run();
   return json({ ok: true });
 }
 
-/** Moves the queued skip counts onto their segments, up to the newest queued row. */
-async function flushSkipInbox(env: Env): Promise<void> {
-  const top = await env.DB.prepare('SELECT MAX(rowid) AS top FROM skip_inbox').first<{ top: number | null }>();
-  if (!top?.top) return;
+/**
+ * Adds the counts of the reports after `from` up to `to` onto their segments in one statement,
+ * so the Worker does no work per report. Time saved is capped at the segment's length per skip,
+ * and a reader's skips of their own segment go to own_skips and own_saved_ms.
+ */
+async function mergeSkips(env: Env, from: number, to: number): Promise<void> {
   await env.DB.batch([
     env.DB.prepare(
-      `UPDATE segments SET
-         skips = skips + (SELECT COALESCE(SUM(n), 0) FROM skip_inbox
-           WHERE skip_inbox.segment_id = segments.id AND skip_inbox.rowid <= ?1 AND own = 0),
-         saved_ms = saved_ms + (SELECT COALESCE(SUM(ms), 0) FROM skip_inbox
-           WHERE skip_inbox.segment_id = segments.id AND skip_inbox.rowid <= ?1 AND own = 0),
-         own_skips = own_skips + (SELECT COALESCE(SUM(n), 0) FROM skip_inbox
-           WHERE skip_inbox.segment_id = segments.id AND skip_inbox.rowid <= ?1 AND own = 1),
-         own_saved_ms = own_saved_ms + (SELECT COALESCE(SUM(ms), 0) FROM skip_inbox
-           WHERE skip_inbox.segment_id = segments.id AND skip_inbox.rowid <= ?1 AND own = 1)
-       WHERE id IN (SELECT segment_id FROM skip_inbox WHERE rowid <= ?1)`,
-    ).bind(top.top),
-    env.DB.prepare('DELETE FROM skip_inbox WHERE rowid <= ?').bind(top.top),
+      `WITH item AS (
+         SELECT r.user_id AS reporter, json_extract(j.value, '$.id') AS id,
+                json_extract(j.value, '$.n') AS n, json_extract(j.value, '$.ms') AS ms
+         FROM skip_reports r, json_each(r.items) j
+         WHERE r.rowid > ?1 AND r.rowid <= ?2
+       ), counted AS (
+         SELECT s.id AS id,
+                SUM(CASE WHEN item.reporter = s.user_id THEN 0 ELSE item.n END) AS others_n,
+                SUM(CASE WHEN item.reporter = s.user_id THEN 0 ELSE MIN(item.ms, item.n * s.duration_ms) END) AS others_ms,
+                SUM(CASE WHEN item.reporter = s.user_id THEN item.n ELSE 0 END) AS own_n,
+                SUM(CASE WHEN item.reporter = s.user_id THEN MIN(item.ms, item.n * s.duration_ms) ELSE 0 END) AS own_ms
+         FROM item JOIN segments s ON s.id = item.id AND s.hidden = 0
+         GROUP BY s.id
+       )
+       UPDATE segments SET
+         skips = skips + counted.others_n, saved_ms = saved_ms + counted.others_ms,
+         own_skips = own_skips + counted.own_n, own_saved_ms = own_saved_ms + counted.own_ms
+       FROM counted WHERE segments.id = counted.id`,
+    ).bind(from, to),
+    env.DB.prepare(
+      "INSERT INTO meta (key, value) VALUES ('skips_merged', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    ).bind(String(to)),
   ]);
 }
 
@@ -463,8 +473,9 @@ async function refreshStats(env: Env): Promise<Record<string, number>> {
   ).first<Record<string, number | null>>();
   const stats = zeroNulls(row);
   await env.DB.prepare(
-    "INSERT INTO meta (key, value) VALUES ('stats', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-  ).bind(JSON.stringify(stats)).run();
+    `INSERT INTO meta (key, value) VALUES ('stats', ?), ('stats_at', ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+  ).bind(JSON.stringify(stats), String(nowSec())).run();
   return stats;
 }
 
@@ -476,16 +487,31 @@ async function clearOldRecords(env: Env): Promise<void> {
     env.DB.prepare('UPDATE segments SET source_aid = NULL, ip_hash = NULL WHERE created_at < ? AND (source_aid IS NOT NULL OR ip_hash IS NOT NULL)')
       .bind(sourceCutoff),
     env.DB.prepare('UPDATE votes SET ip_hash = NULL WHERE created_at < ? AND ip_hash IS NOT NULL').bind(sourceCutoff),
-    env.DB.prepare('DELETE FROM skip_reports WHERE created_at < ?').bind(now - REPORT_RETENTION_SECONDS),
+    // The newest report stays, so rowids keep growing and skips_merged keeps pointing at them.
+    env.DB.prepare('DELETE FROM skip_reports WHERE created_at < ? AND rowid < (SELECT MAX(rowid) FROM skip_reports)')
+      .bind(now - REPORT_RETENTION_SECONDS),
   ]);
 }
 
-async function maintain(env: Env): Promise<void> {
-  await flushSkipInbox(env);
-  await refreshStats(env);
-  await clearOldRecords(env);
-  const dirty = await env.DB.prepare("SELECT value FROM meta WHERE key = 'snapshot_dirty'").first<{ value: string }>();
-  if (dirty?.value === '1' || new Date().getUTCHours() === 1) await rebuildSnapshot(env);
+/**
+ * The hourly run. One query finds out what changed, so an idle hour costs a few rows; the stats
+ * are counted again only after a change, and the retention cleanup and the snapshot run daily.
+ */
+async function maintain(env: Env, at: Date): Promise<void> {
+  const state = await env.DB.prepare(
+    `SELECT (SELECT MAX(rowid) FROM skip_reports) AS reports,
+            (SELECT value FROM meta WHERE key = 'skips_merged') AS merged,
+            (SELECT MAX(updated_at) FROM segments) AS changed,
+            (SELECT value FROM meta WHERE key = 'stats_at') AS stats_at,
+            (SELECT value FROM meta WHERE key = 'snapshot_dirty') AS dirty`,
+  ).first<{ reports: number | null; merged: string | null; changed: number | null; stats_at: string | null; dirty: string | null }>();
+  const daily = at.getUTCHours() === 1;
+  const merged = Number(state?.merged ?? 0);
+  const reports = state?.reports ?? 0;
+  if (reports > merged) await mergeSkips(env, merged, reports);
+  if (reports > merged || (state?.changed ?? 0) >= Number(state?.stats_at ?? 0) || daily) await refreshStats(env);
+  if (daily) await clearOldRecords(env);
+  if (state?.dirty === '1' || daily) await rebuildSnapshot(env);
 }
 
 /**
@@ -494,7 +520,7 @@ async function maintain(env: Env): Promise<void> {
  * the flag again and the next hourly run rebuilds.
  */
 async function rebuildSnapshot(env: Env): Promise<void> {
-  const asOf = nowSec();
+  const asOf = hourStart(nowSec());
   await env.DB.prepare("UPDATE meta SET value = '0' WHERE key = 'snapshot_dirty'").run();
   const count = (await env.DB.prepare("SELECT COUNT(*) AS n FROM segments WHERE hidden = 0 AND status = 'active'")
     .first<{ n: number }>())?.n ?? 0;
@@ -758,8 +784,20 @@ function nowSec(): number {
 function json(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json', ...headers },
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers },
   });
+}
+
+/**
+ * Lets Workers Caching answer until a minute past the next hourly run, which is when the stats,
+ * the snapshot and the hour that changes are counted from can next change.
+ */
+function untilNextRun(): string {
+  return 'public, max-age=' + (HOUR_SECONDS - (nowSec() % HOUR_SECONDS) + 60);
+}
+
+function hourStart(t: number): number {
+  return t - (t % HOUR_SECONDS);
 }
 
 function err(status: number, message: string): Response {

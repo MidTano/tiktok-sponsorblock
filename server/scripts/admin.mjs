@@ -145,7 +145,6 @@ switch (command) {
     const row = senderOf(n);
     const user = quote(row.user_id);
     const owned = 'SELECT id FROM segments WHERE user_id = ' + user;
-    sql('DELETE FROM skip_inbox WHERE segment_id IN (' + owned + ')');
     sql('DELETE FROM votes WHERE segment_id IN (' + owned + ') OR user_id = ' + user);
     sql('DELETE FROM skip_reports WHERE user_id = ' + user);
     sql('DELETE FROM segments WHERE user_id = ' + user);

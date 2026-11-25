@@ -2,6 +2,11 @@
   "name": "metra-adskip",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-01",
+
+  // Workers Caching answers the public GETs (stats, snapshot, deltas) from Cloudflare's cache
+  // without running the Worker, so they cost no D1 reads or R2 operations. Every other response
+  // says no-store. Cache hits still count towards the daily request limit.
+  "cache": { "enabled": true },
   "account_id": "943ad1cd29711dec0741bbab64061011",
 
   "d1_databases": [

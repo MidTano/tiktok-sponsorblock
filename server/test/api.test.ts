@@ -6,7 +6,7 @@ beforeEach(async () => {
   await env.DB.batch([
     env.DB.prepare('DELETE FROM segments'),
     env.DB.prepare('DELETE FROM votes'),
-    env.DB.prepare('DELETE FROM skip_inbox'),
+    env.DB.prepare("DELETE FROM meta WHERE key = 'skips_merged'"),
     env.DB.prepare('DELETE FROM skip_reports'),
     env.DB.prepare('DELETE FROM bans'),
     env.DB.prepare("UPDATE meta SET value = '1' WHERE key = 'snapshot_dirty'"),
@@ -57,10 +57,17 @@ function skips(ip: string, uid: string, items: unknown[]): Promise<Response> {
   });
 }
 
-async function runHourly(): Promise<void> {
+async function runHourly(scheduledTime = Date.now()): Promise<void> {
   const ctx = createExecutionContext();
-  await worker.scheduled(createScheduledController({ cron: '0 * * * *' }) as ScheduledController, env, ctx);
+  await worker.scheduled(createScheduledController({ cron: '0 * * * *', scheduledTime }) as ScheduledController, env, ctx);
   await waitOnExecutionContext(ctx);
+}
+
+/** The run at 01:00 UTC, which also clears old records and rebuilds the snapshot. */
+function runDaily(): Promise<void> {
+  const at = new Date();
+  at.setUTCHours(1, 0, 0, 0);
+  return runHourly(at.getTime());
 }
 
 describe('request limits', () => {
@@ -169,7 +176,7 @@ describe('accounts', () => {
     await env.DB.prepare(
       "INSERT INTO segments (id, num, user_id, ip_hash, name, duration_ms, source_aid, frames, hash_count, hashes, times, created_at, updated_at) VALUES (?, 5000, 'sb:old', 'oldnet', 'Old', 2000, '7300000000000000001', 62, 0, ?, ?, ?, ?)",
     ).bind(crypto.randomUUID(), new ArrayBuffer(0), new ArrayBuffer(0), old, old).run();
-    await runHourly();
+    await runDaily();
     const row = await env.DB.prepare("SELECT source_aid, ip_hash FROM segments WHERE user_id = 'sb:old'")
       .first<{ source_aid: string | null; ip_hash: string | null }>();
     expect(row).toEqual({ source_aid: null, ip_hash: null });
@@ -281,6 +288,28 @@ describe('skip reports', () => {
     expect(row?.skips).toBe(0);
   });
 
+  it('keeps a report as one row however many ads it covers', async () => {
+    const ids: string[] = [];
+    for (const seed of [21, 22, 23]) ids.push((await (await submit('198.51.100.45', '2323232323', seed)).json<{ id: string }>()).id);
+    await skips('198.51.100.46', '2424242424', ids.map((id) => ({ id, n: 1, ms: 1000 })));
+    const reports = await env.DB.prepare('SELECT COUNT(*) AS n FROM skip_reports').first<{ n: number }>();
+    expect(reports?.n).toBe(1);
+    await runHourly();
+    const merged = await env.DB.prepare('SELECT SUM(skips) AS n FROM segments WHERE user_id = (SELECT user_id FROM segments WHERE id = ?)')
+      .bind(ids[0]).first<{ n: number }>();
+    expect(merged?.n).toBe(3);
+  });
+
+  it('keeps the newest report through the cleanup, so merging carries on after a quiet spell', async () => {
+    const old = Math.floor(Date.now() / 1000) - 4 * 86_400;
+    for (let i = 0; i < 3; i++) {
+      await env.DB.prepare("INSERT INTO skip_reports (user_id, ip_hash, created_at, items) VALUES ('sb:x', 'net', ?, '[]')").bind(old).run();
+    }
+    await runDaily();
+    const left = await env.DB.prepare('SELECT COUNT(*) AS n FROM skip_reports').first<{ n: number }>();
+    expect(left?.n).toBe(1);
+  });
+
   it("counts an author's own skips in the base's totals but not in what they saved others", async () => {
     const { id } = await (await submit('198.51.100.40', '2020202020', 12)).json<{ id: string }>();
     await skips('198.51.100.41', '2020202020', [{ id, n: 2, ms: 1500 }]);
@@ -293,6 +322,24 @@ describe('skip reports', () => {
       headers: { 'X-TT-UID': '2020202020', 'CF-Connecting-IP': '198.51.100.44' },
     })).json<{ skips: number; saved_ms: number }>();
     expect(me).toMatchObject({ skips: 1, saved_ms: 1000 });
+  });
+});
+
+describe('caching', () => {
+  it("lets Workers Caching keep the stats but never a reader's own numbers", async () => {
+    const stats = await SELF.fetch('https://base.test/v1/stats', { headers: { 'CF-Connecting-IP': '198.51.100.50' } });
+    expect(stats.headers.get('Cache-Control')).toMatch(/^public, max-age=\d+$/);
+    const me = await SELF.fetch('https://base.test/v1/me', {
+      headers: { 'X-TT-UID': '2222222222', 'CF-Connecting-IP': '198.51.100.51' },
+    });
+    expect(me.headers.get('Cache-Control')).toBe('no-store');
+    expect(await me.json()).toHaveProperty('base.active');
+  });
+
+  it('answers a delta as of the start of the hour, so phones share cached answers', async () => {
+    const res = await SELF.fetch('https://base.test/v1/db/since?t=0', { headers: { 'CF-Connecting-IP': '198.51.100.52' } });
+    expect(Number(res.headers.get('X-Db-Time')) % 3600).toBe(0);
+    expect(res.headers.get('Cache-Control')).toMatch(/^public, max-age=\d+$/);
   });
 });
 

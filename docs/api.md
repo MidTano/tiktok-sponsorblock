@@ -8,29 +8,36 @@ account. Until 23 January 2027 the old `X-TT-UID` header (the TikTok account id)
 keyed the same way. Every limit is also counted per network address, kept only as a keyed hash;
 an IPv6 client counts as its /64. Errors are JSON: `{"error": "message"}`.
 
+The public GETs (`/v1/db.bin`, `/v1/db/since`, `/v1/stats`) say `Cache-Control: public` and are
+answered by Workers Caching without running the Worker; everything else says `no-store`.
+
 ## Reading
 
 ### `GET /v1/db.bin`
 
-Every visible segment, as a snapshot. It is rebuilt after a change and at 01:00 UTC each day, and cached for an hour. Until the first build the reply is `503` with `Retry-After: 300`.
-`X-Db-Time` is the Unix time the snapshot is current as of. 60 requests a minute per address.
+Every visible segment, as a snapshot. It is rebuilt at 01:00 UTC each day and after a moderator's
+change, and cached until a minute past the next hourly run. Until the first build the reply is `503` with `Retry-After: 300`.
+`X-Db-Time` is the start of the hour the snapshot is current as of. 60 requests a minute per address.
 
 ### `GET /v1/db/since?t=EPOCH`
 
 Every segment changed at or after `t`, hidden ones included with the hidden flag set so phones
 drop them. A page holds at most 4 MB of data, about 100 segments at the largest size. `X-Db-Time` is the `t` to ask with next, and `X-Db-More: 1`
 says the page was full and the next one should be fetched now. Rows at the page boundary can
-arrive twice; apply them by id.
+arrive twice; apply them by id. A last page answers as of the start of the current hour, so phones
+ask with whole hours and most of their requests are answered from the cache; rows changed since
+that hour arrive again next time.
 
 ### `GET /v1/stats`
 
 `{"total", "active", "contributors", "votes_up", "votes_down", "skips", "saved_ms"}` for the
-whole base.
+whole base, counted at each hourly run that follows a change and cached until the next one.
 
 ### `GET /v1/me` (needs `X-SB-Token`)
 
-`{"segments", "skips", "saved_ms", "votes_up", "votes_down"}`: the caller's visible segments and
-how much they saved other viewers.
+`{"segments", "skips", "saved_ms", "votes_up", "votes_down", "base"}`: the caller's visible
+segments and how much they saved other viewers, with `base` holding what `/v1/stats` returns, so
+one request fills a statistics card. Never cached.
 
 ### `GET /v1/health`
 

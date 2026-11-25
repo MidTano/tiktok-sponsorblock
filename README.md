@@ -32,12 +32,45 @@ This repository holds the parts any TikTok mod can reuse:
 
 The details are in [docs/how-it-works.md](docs/how-it-works.md).
 
+## How the pieces fit together
+
+Two repositories make up the project, and they talk only over HTTPS:
+
+- **This one** is the shared side: the server everyone's phones sync with, the matching library
+  and the docs. Nothing in it knows about TikTok's code, and it runs on Cloudflare, not on phones.
+- **[metra-tiktok-sponsorblock](https://github.com/MidTano/metra-tiktok-sponsorblock)** is the
+  phone side: Metra's TikTok patches plus the **Skip ads by sound** patch, installed through
+  Morphe Manager. It hooks TikTok's player and share sheet, holds its own copy of the matching
+  code, and syncs with the server.
+
+```mermaid
+flowchart LR
+  subgraph Phone["Phone: TikTok patched with Metra"]
+    Patch["Skip ads by sound<br/>marks, matching, skipping"]
+  end
+  subgraph Cloudflare["Cloudflare, free plan"]
+    Worker["Worker<br/>server/src/index.ts"]
+    D1[("D1<br/>segments, votes, counts")]
+    R2[("R2<br/>daily snapshot")]
+  end
+  Patch -- "new marks, votes, skip counts" --> Worker
+  Worker -- "the base: snapshot and daily changes" --> Patch
+  Worker --- D1
+  Worker --- R2
+```
+
+The patch works without the server, with only the viewer's own marks. The server works without
+the patch: any mod that speaks [the API](docs/api.md) can use it, and anyone can run their own
+copy, see [server/README.md](server/README.md).
+
 ## For users
 
-You need a TikTok mod that supports it. The first is the **Skip ads by sound** feature in Metra, a fork of
+You need a TikTok mod that supports it. The first is the **Skip ads by sound** patch in
+[metra-tiktok-sponsorblock](https://github.com/MidTano/metra-tiktok-sponsorblock), a fork of
 [icysymmetra/tiktok-patches-for-morphe](https://github.com/icysymmetra/tiktok-patches-for-morphe),
-TikTok patches for [Morphe](https://github.com/MorpheApp). The fork is not published yet, so there
-is no download; the link appears here once it is. Other mods are welcome to add it; see below.
+TikTok patches for [Morphe](https://github.com/MorpheApp). Its
+[install guide](https://github.com/MidTano/metra-tiktok-sponsorblock/blob/main/docs/INSTALL.md)
+walks through it. Other mods are welcome to add it; see below.
 
 What the feature shows you: marks on the seek bar where an ad sits, a short notice when one is
 skipped with buttons to undo or vote, a list of the ads you marked, and statistics on how many
