@@ -60,8 +60,8 @@ first sample fed: a mod that starts feeding mid-video must add the video's offse
 - Offer votes on that notice, and remember the viewer's vote so they see it next time.
 - Never skip into the next video: clamp the seek to the video's length.
 - Let the viewer turn off the shared base and keep only their own marks.
-- Sync the base at most once a day, send skip counts at most twice a day and only when something
-  was skipped, and keep the statistics for an hour; [server/README.md](../server/README.md) shows
+- Sync the base, send skip counts (only when something was skipped) and refresh the statistics at
+  most once a day, and wait a day after a failed attempt too; [server/README.md](../server/README.md) shows
   what each request costs the free plan.
 - Tell the viewer what leaves the phone; [privacy.md](privacy.md) is the list a mod can link.
 

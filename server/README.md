@@ -91,7 +91,7 @@ What keeps a phone cheap:
   daily run adds them to the segments in a single statement.
 - **Daily maintenance**, at 01:00 UTC, merges reports, refreshes totals, clears old records and
   publishes the snapshot. No hourly idle checks.
-- **The updated phone asks rarely**: the base once a day, skip counts once a day and only when it
+- **The phone asks rarely** (Metra v0.12.2 and later): the base once a day, skip counts once a day and only when it
   skipped something, statistics once a day and only when the list is open, in one
   request (`/v1/me` carries the totals). Pending votes send their latest value at daily sync;
   local down-votes and undo apply immediately. A newly marked ad can upload immediately.
@@ -118,8 +118,8 @@ exports also contribute even with one phone. The normal client budget is one dai
 when the list is opened: normally up to three requests without submissions or pending votes.
 Submissions, queued votes and older installed clients add traffic. Automatic failed sync/statistics
 attempts wait 24 hours, including across restarts; concurrent statistics loads are coalesced.
-These client changes only take effect after installing a new build. The server still permits two
-reports per rolling day for compatibility with older clients; this is not the new client's interval.
+Versions before v0.12.2 report twice a day and refresh statistics hourly while the list is open;
+the server still accepts two reports a day for them.
 
 Never publicly cache `/v1/me`, writes, errors or anything keyed by a token, and do not add a
 blanket Cache Everything rule for the API.
