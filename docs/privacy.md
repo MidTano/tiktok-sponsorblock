@@ -6,14 +6,14 @@ Nothing is sent while the shared base is off. With it on:
 | --- | --- | --- |
 | Once a day | a download request, with the time of the last sync | to get new and hidden segments |
 | When you mark an ad | its audio landmarks (32-bit hashes and their times), its length, the name you gave it, the TikTok video id it was cut from, your sync token | so other phones can skip it; the video id lets moderators check a report |
-| When you vote | the segment id, up or down, your sync token | one vote per account |
-| Twice a day | for each shared ad skipped on this phone: its id, how many times, how much time it saved | the statistics card |
-| On the statistics card | your sync token | your own totals |
+| Daily sync, if votes are pending | the segment id, latest vote or cancellation, your sync token | one vote per account; local down-votes apply immediately |
+| Once per 24 hours, if nonempty | a random report id, and for each shared ad skipped: its id, count and time saved | the statistics card; exact retries do not count twice |
+| On the statistics card, at most once per 24 hours | your sync token | your own totals |
 
 Not sent: audio, video, where you are, anything about videos with no ad.
 
 Landmarks are a few thousand numbers describing where the loudest points of a sound sit. They
-cannot be turned back into audio.
+are not an audio recording, but can still identify a repeated sound and should be treated as derived audio data.
 
 The server sees your network address on every request, like any website. It stores the
 address only as a keyed hash (HMAC-SHA-256), used to count daily limits and to stop one network from
@@ -25,7 +25,7 @@ clients that still send the old header, which stops being accepted on 23 January
 the maintainer remove everything from one account that floods the base.
 
 The video id of an ad you mark is kept for 30 days, then cleared. Addresses are cleared after 30 days,
-and skip reports are kept for 3 days.
+and skip-report payloads are cleared after 3 days once merged. Minimal receipts (random report id, keyed account/network hashes and timestamp) are kept for 30 days to deduplicate retries, then deleted, including the last receipt. Cleanup runs daily.
 
 The public instance runs on Cloudflare Workers, D1 and R2; Cloudflare's own logging applies.
 To have your segments and votes deleted, open an issue or follow [SECURITY.md](../SECURITY.md)

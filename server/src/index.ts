@@ -145,7 +145,7 @@ export default {
     }
   },
 
-  /** Merges queued skip counts, refreshes the stats and clears old addresses, every hour. */
+  /** Daily maintenance: merge skip counts, refresh stats, clear old addresses and publish. */
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(maintain(env, new Date(event.scheduledTime)));
   },
@@ -174,10 +174,12 @@ async function route(req: Request, env: Env): Promise<Response> {
 async function handleStats(req: Request, env: Env): Promise<Response> {
   const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + clientNetwork(req) });
   if (!success) return err(429, 'Too many requests');
-  const cached = await env.DB.prepare("SELECT value FROM meta WHERE key = 'stats'").first<{ value: string }>();
+  const cached = await env.DB.prepare(
+    "SELECT value, (SELECT value FROM meta WHERE key = 'stats_at') AS published FROM meta WHERE key = 'stats'",
+  ).first<{ value: string; published: string | null }>();
   const body = cached ? cached.value : JSON.stringify(await refreshStats(env));
   return new Response(body, {
-    headers: { 'Content-Type': 'application/json', 'Cache-Control': untilNextRun() },
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': untilNextRun(cached ? Number(cached.published ?? 0) : nowSec()) },
   });
 }
 
@@ -207,7 +209,7 @@ async function handleFullDb(req: Request, env: Env): Promise<Response> {
   return new Response(obj.body, {
     headers: {
       'Content-Type': 'application/octet-stream',
-      'Cache-Control': untilNextRun(),
+      'Cache-Control': untilNextRun(Math.floor(obj.uploaded.getTime() / 1000)),
       'Last-Modified': obj.uploaded.toUTCString(),
       'X-Db-Time': obj.customMetadata?.as_of ?? String(Math.floor(obj.uploaded.getTime() / 1000)),
     },
@@ -222,13 +224,18 @@ async function handleDelta(req: Request, env: Env): Promise<Response> {
   const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + clientNetwork(req) });
   if (!success) return err(429, 'Too many requests');
 
-  const since = Number(new URL(req.url).searchParams.get('t') ?? '0');
-  if (!Number.isFinite(since) || since < 0) return err(400, 'Bad t');
+  // Capture before querying: crossing an hour while reading must not advance past unseen changes.
+  const startedAt = nowSec();
+  const params = new URL(req.url).searchParams;
+  const since = Number(params.get('t') ?? '0');
+  const after = params.get('after') ?? '';
+  if (!Number.isSafeInteger(since) || since < 0) return err(400, 'Bad t');
+  if (after && !UUID_RE.test(after)) return err(400, 'Bad cursor');
 
   const scan = (await env.DB.prepare(
     `SELECT id, updated_at, 40 + hash_count * 8 AS bytes FROM segments
-     WHERE updated_at >= ? AND status != 'pending' ORDER BY updated_at, id LIMIT ?`,
-  ).bind(since, DELTA_SCAN).all<{ id: string; updated_at: number; bytes: number }>()).results ?? [];
+     WHERE updated_at >= ? AND (updated_at > ? OR id > ?) AND status != 'pending' ORDER BY updated_at, id LIMIT ?`,
+  ).bind(since, since, after.toLowerCase(), DELTA_SCAN).all<{ id: string; updated_at: number; bytes: number }>()).results ?? [];
 
   let total = 0;
   let take = 0;
@@ -239,20 +246,24 @@ async function handleDelta(req: Request, env: Env): Promise<Response> {
   const rows = last
     ? (await env.DB.prepare(
         `SELECT id, num, frames, duration_ms, score, hidden, hash_count, hashes, times, updated_at FROM segments
-         WHERE updated_at >= ? AND status != 'pending' AND (updated_at < ? OR (updated_at = ? AND id <= ?))
+         WHERE updated_at >= ? AND (updated_at > ? OR id > ?) AND status != 'pending'
+           AND (updated_at < ? OR (updated_at = ? AND id <= ?))
          ORDER BY updated_at, id`,
-      ).bind(since, last.updated_at, last.updated_at, last.id).all<SegmentRow & { updated_at: number }>()).results ?? []
+      ).bind(since, since, after.toLowerCase(), last.updated_at, last.updated_at, last.id).all<SegmentRow & { updated_at: number }>()).results ?? []
     : [];
 
   // Whole hours, so phones ask from the same few times and Workers Caching answers most of them.
   // A row changed since the hour began is sent again next time, which a phone merges as a no-op.
-  const asOf = more && last ? last.updated_at : hourStart(nowSec());
+  // A continuation must replay its boundary hour on the next daily sync: a concurrent
+  // same-second change may have an id behind the cursor. Never advance past that window.
+  const asOf = more && last ? last.updated_at : hourStart(after ? since : startedAt);
   return new Response(packRows(rows), {
     headers: {
       'Content-Type': 'application/octet-stream',
       'Cache-Control': untilNextRun(),
       'X-Db-Time': String(asOf),
       'X-Db-More': more ? '1' : '0',
+      ...(more && last ? { 'X-Db-Cursor': last.id } : {}),
     },
   });
 }
@@ -260,12 +271,11 @@ async function handleDelta(req: Request, env: Env): Promise<Response> {
 async function handleSubmit(req: Request, env: Env): Promise<Response> {
   const user = await userOf(req, env);
   const net = clientNetwork(req);
-  const netHash = await hashNetwork(env, net);
-  if (await banned(env, user, netHash)) return err(403, 'Banned');
-
-  // Over a limit the reply is 202: the phone keeps the segment and sends it another day.
+  // Reject bursts before any D1 query, including the ban lookup.
   const { success } = await env.SUBMIT_LIMITER.limit({ key: 'ip:' + net });
   if (!success) return json({ queued: true }, 202);
+  const netHash = await hashNetwork(env, net);
+  if (await banned(env, user, netHash)) return err(403, 'Banned');
   const used = await countsToday(env, 'segments', user, netHash);
   if (used.byUid >= SUBMITS_PER_UID_DAY || used.byIp >= SUBMITS_PER_IP_DAY) return json({ queued: true }, 202);
   const day = await env.DB.prepare('SELECT COUNT(*) AS n FROM segments WHERE created_at > ?')
@@ -336,11 +346,10 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
   if (!UUID_RE.test(rawId)) return err(400, 'Invalid segment id');
   const segmentId = rawId.toLowerCase();
   const net = clientNetwork(req);
-  const netHash = await hashNetwork(env, net);
-  if (await banned(env, user, netHash)) return err(403, 'Banned');
-
   const { success } = await env.VOTE_LIMITER.limit({ key: 'ip:' + net });
   if (!success) return err(429, 'Too many votes, slow down');
+  const netHash = await hashNetwork(env, net);
+  if (await banned(env, user, netHash)) return err(403, 'Banned');
   const used = await countsToday(env, 'votes', user, netHash);
   if (used.byUid >= VOTES_PER_UID_DAY || used.byIp >= VOTES_PER_IP_DAY) return err(429, 'Too many votes today');
 
@@ -395,19 +404,30 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
 }
 
 /**
- * Keeps one phone's skip counts as a single row. They reach the segments at the next hourly
+ * Keeps one phone's skip counts as a single row. They reach the segments at the next daily
  * merge, so a report costs a few rows written however many ads it covers. A reader's skips of
  * their own segments count only towards the base's totals.
  */
 async function handleSkips(req: Request, env: Env): Promise<Response> {
   const user = await userOf(req, env);
-  const netHash = await hashNetwork(env, clientNetwork(req));
+  // Share the read burst budget; a broken client cannot keep querying D1 after its daily quota.
+  const net = clientNetwork(req);
+  const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + net });
+  if (!success) return err(429, 'Too many requests');
+  const netHash = await hashNetwork(env, net);
   if (await banned(env, user, netHash)) return err(403, 'Banned');
 
+  const body = await readJson<{ skips: SkipItem[]; report_id?: string }>(req, MAX_SMALL_BODY);
+  if (body.report_id !== undefined && (typeof body.report_id !== 'string' || !UUID_RE.test(body.report_id)))
+    return err(400, 'Bad report_id');
+  const reportId = body.report_id?.toLowerCase();
+  if (reportId) {
+    const duplicate = await env.DB.prepare('SELECT 1 AS found FROM skip_reports WHERE user_id = ? AND report_id = ?')
+      .bind(user, reportId).first();
+    if (duplicate) return json({ ok: true, duplicate: true });
+  }
   const reports = await countsToday(env, 'skip_reports', user, netHash);
   if (reports.byUid >= REPORTS_PER_DAY || reports.byIp >= REPORTS_PER_DAY * 5) return err(429, 'Already reported today');
-
-  const body = await readJson<{ skips: SkipItem[] }>(req, MAX_SMALL_BODY);
   if (!Array.isArray(body.skips)) return err(400, 'skips must be a list');
 
   const merged = new Map<string, SkipItem>();
@@ -422,8 +442,8 @@ async function handleSkips(req: Request, env: Env): Promise<Response> {
   if (merged.size > MAX_REPORT_IDS) return err(400, 'A report covers at most ' + MAX_REPORT_IDS + ' segments');
 
   const items = [...merged.values()].filter((item) => item.n > 0);
-  await env.DB.prepare('INSERT INTO skip_reports (user_id, ip_hash, created_at, items) VALUES (?, ?, ?, ?)')
-    .bind(user, netHash, nowSec(), JSON.stringify(items)).run();
+  await env.DB.prepare('INSERT INTO skip_reports (user_id, ip_hash, created_at, items, report_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, report_id) DO NOTHING')
+    .bind(user, netHash, nowSec(), JSON.stringify(items), reportId ?? null).run();
   return json({ ok: true });
 }
 
@@ -487,15 +507,19 @@ async function clearOldRecords(env: Env): Promise<void> {
     env.DB.prepare('UPDATE segments SET source_aid = NULL, ip_hash = NULL WHERE created_at < ? AND (source_aid IS NOT NULL OR ip_hash IS NOT NULL)')
       .bind(sourceCutoff),
     env.DB.prepare('UPDATE votes SET ip_hash = NULL WHERE created_at < ? AND ip_hash IS NOT NULL').bind(sourceCutoff),
-    // The newest report stays, so rowids keep growing and skips_merged keeps pointing at them.
-    env.DB.prepare('DELETE FROM skip_reports WHERE created_at < ? AND rowid < (SELECT MAX(rowid) FROM skip_reports)')
+    // AUTOINCREMENT preserves the merge cursor even when the table becomes empty.
+    // Never delete reports not yet merged (including arrivals during this maintenance run).
+    env.DB.prepare("UPDATE skip_reports SET items = NULL WHERE created_at < ? AND items IS NOT NULL AND rowid <= COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'skips_merged'), 0)")
       .bind(now - REPORT_RETENTION_SECONDS),
+    // Keep only deduplication receipts for 30 days; no per-segment counts remain after 3 days.
+    env.DB.prepare("DELETE FROM skip_reports WHERE created_at < ? AND rowid <= COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'skips_merged'), 0)")
+      .bind(now - 30 * DAY_SECONDS),
   ]);
 }
 
 /**
- * The hourly run. One query finds out what changed, so an idle hour costs a few rows; the stats
- * are counted again only after a change, and the retention cleanup and the snapshot run daily.
+ * The daily run. One query finds out what changed, so an idle day costs a few rows; the stats
+ * are counted again only after a change, and the retention cleanup and the snapshot run at 01 UTC.
  */
 async function maintain(env: Env, at: Date): Promise<void> {
   const state = await env.DB.prepare(
@@ -517,20 +541,22 @@ async function maintain(env: Env, at: Date): Promise<void> {
 /**
  * Builds the snapshot as an R2 multipart upload, a page of segments at a time, so the whole base
  * never sits in memory. The flag is cleared before the build, so a change made during it sets
- * the flag again and the next hourly run rebuilds.
+ * the flag again and the next daily run rebuilds.
  */
 async function rebuildSnapshot(env: Env): Promise<void> {
   const asOf = hourStart(nowSec());
   await env.DB.prepare("UPDATE meta SET value = '0' WHERE key = 'snapshot_dirty'").run();
-  const count = (await env.DB.prepare("SELECT COUNT(*) AS n FROM segments WHERE hidden = 0 AND status = 'active'")
-    .first<{ n: number }>())?.n ?? 0;
+  // Count the rows actually encoded, not a separate COUNT which races submissions/votes.
+  let count = 0;
   const upload = await env.BUCKET.createMultipartUpload('db.bin', {
     httpMetadata: { contentType: 'application/octet-stream' },
-    customMetadata: { as_of: String(asOf), format: SNAPSHOT_FORMAT, count: String(count) },
+    customMetadata: { as_of: String(asOf), format: SNAPSHOT_FORMAT },
   });
   try {
     const parts: R2UploadedPart[] = [];
-    let pending: Uint8Array[] = [snapshotHeader(count)];
+    // Keep the first part until the true count is known. Later parts stream to R2.
+    let firstPart: Uint8Array | undefined;
+    let pending: Uint8Array[] = [snapshotHeader(0)];
     let pendingBytes = 12;
     let lastNum = 0;
     for (;;) {
@@ -543,18 +569,28 @@ async function rebuildSnapshot(env: Env): Promise<void> {
         const bytes = encodeRow(row);
         pending.push(bytes);
         pendingBytes += bytes.byteLength;
+        count++;
       }
       const next = rows[rows.length - 1].num;
       if (next == null) throw new Error('A segment has no number');
       lastNum = next;
       if (pendingBytes >= SNAPSHOT_PART_BYTES) {
-        parts.push(await upload.uploadPart(parts.length + 1, concatBytes(pending)));
-        pending = [];
-        pendingBytes = 0;
+        let bytes = concatBytes(pending);
+        while (bytes.byteLength >= SNAPSHOT_PART_BYTES) {
+          const part = bytes.slice(0, SNAPSHOT_PART_BYTES);
+          if (!firstPart) firstPart = part;
+          else parts.push(await upload.uploadPart(parts.length + 2, part));
+          bytes = bytes.slice(SNAPSHOT_PART_BYTES);
+        }
+        pending = bytes.byteLength ? [bytes] : [];
+        pendingBytes = bytes.byteLength;
       }
     }
-    if (pending.length > 0) parts.push(await upload.uploadPart(parts.length + 1, concatBytes(pending)));
-    await upload.complete(parts);
+    if (!firstPart) firstPart = concatBytes(pending);
+    else if (pending.length > 0) parts.push(await upload.uploadPart(parts.length + 2, concatBytes(pending)));
+    new DataView(firstPart.buffer, firstPart.byteOffset, firstPart.byteLength).setUint32(8, count, true);
+    const first = await upload.uploadPart(1, firstPart);
+    await upload.complete([first, ...parts]);
   } catch (failure) {
     await upload.abort();
     throw failure;
@@ -789,11 +825,14 @@ function json(data: unknown, status = 200, headers: Record<string, string> = {})
 }
 
 /**
- * Lets Workers Caching answer until a minute past the next hourly run, which is when the stats,
- * the snapshot and the hour that changes are counted from can next change.
+ * Public responses may stay cached until a minute past the next daily publication.
+ * Deltas can include newer changes on a cache miss; daily freshness is intentional.
  */
-function untilNextRun(): string {
-  return 'public, max-age=' + (HOUR_SECONDS - (nowSec() % HOUR_SECONDS) + 60);
+function untilNextRun(published = nowSec()): string {
+  // Yesterday's generation served during maintenance must not live another day.
+  const sinceRun = ((published - HOUR_SECONDS) % DAY_SECONDS + DAY_SECONDS) % DAY_SECONDS;
+  const nextRun = published + DAY_SECONDS - sinceRun;
+  return 'public, max-age=' + Math.max(60, nextRun + 60 - nowSec());
 }
 
 function hourStart(t: number): number {

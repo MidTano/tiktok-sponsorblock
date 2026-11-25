@@ -71,6 +71,25 @@ function runDaily(): Promise<void> {
 }
 
 describe('request limits', () => {
+  it('rejects bursts on all write routes before querying D1', async () => {
+    let queries = 0;
+    const limited = {
+      ...env,
+      DB: { prepare() { queries++; throw new Error('D1 must not run'); } } as unknown as D1Database,
+      SUBMIT_LIMITER: { limit: async () => ({ success: false }) },
+      VOTE_LIMITER: { limit: async () => ({ success: false }) },
+      READ_LIMITER: { limit: async () => ({ success: false }) },
+    };
+    const paths = ['/v1/segments', '/v1/skips', '/v1/segments/12345678-1234-4234-8234-1234567890ab/vote'];
+    for (const path of paths) {
+      const response = await worker.fetch(new Request('https://base.test' + path, {
+        method: 'POST', headers: { 'X-SB-Token': 'A'.repeat(43) },
+      }), limited);
+      expect(response.status).toBe(path === '/v1/segments' ? 202 : 429);
+    }
+    expect(queries).toBe(0);
+  });
+
   it('refuses a body over the limit with 413', async () => {
     const res = await SELF.fetch('https://base.test/v1/segments', {
       method: 'POST',
@@ -300,14 +319,19 @@ describe('skip reports', () => {
     expect(merged?.n).toBe(3);
   });
 
-  it('keeps the newest report through the cleanup, so merging carries on after a quiet spell', async () => {
-    const old = Math.floor(Date.now() / 1000) - 4 * 86_400;
+  it('deletes even the newest expired receipt and keeps sequence after a quiet spell', async () => {
+    const old = Math.floor(Date.now() / 1000) - 31 * 86_400;
     for (let i = 0; i < 3; i++) {
       await env.DB.prepare("INSERT INTO skip_reports (user_id, ip_hash, created_at, items) VALUES ('sb:x', 'net', ?, '[]')").bind(old).run();
     }
     await runDaily();
     const left = await env.DB.prepare('SELECT COUNT(*) AS n FROM skip_reports').first<{ n: number }>();
-    expect(left?.n).toBe(1);
+    expect(left?.n).toBe(0);
+    await env.DB.prepare("INSERT INTO skip_reports (user_id, ip_hash, created_at, items) VALUES ('sb:y', 'net', ?, '[]')")
+      .bind(Math.floor(Date.now() / 1000)).run();
+    const next = await env.DB.prepare('SELECT rowid AS n FROM skip_reports').first<{ n: number }>();
+    const merged = await env.DB.prepare("SELECT value FROM meta WHERE key = 'skips_merged'").first<{ value: string }>();
+    expect(next!.n).toBeGreaterThan(Number(merged!.value));
   });
 
   it("counts an author's own skips in the base's totals but not in what they saved others", async () => {
@@ -326,6 +350,25 @@ describe('skip reports', () => {
 });
 
 describe('caching', () => {
+  it('does not cache an overdue generation for another day during publication', async () => {
+    await env.DB.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('stats', '{}'), ('stats_at', ?)")
+      .bind(String(Math.floor(Date.now() / 1000) - 2 * 86400)).run();
+    const res = await SELF.fetch('https://base.test/v1/stats', { headers: { 'CF-Connecting-IP': '198.51.100.54' } });
+    expect(res.headers.get('Cache-Control')).toBe('public, max-age=60');
+  });
+
+  it('keeps public responses until the next daily publication, not merely the next hour', async () => {
+    const before = Math.floor(Date.now() / 1000);
+    const res = await SELF.fetch('https://base.test/v1/stats', { headers: { 'CF-Connecting-IP': '198.51.100.53' } });
+    const after = Math.floor(Date.now() / 1000);
+    const ttl = Number(res.headers.get('Cache-Control')?.split('=')[1]);
+    const nextRun = (t: number) => t + 86400 - (((t - 3600) % 86400 + 86400) % 86400) + 60;
+    expect(ttl).toBeGreaterThanOrEqual(60);
+    expect(ttl).toBeLessThanOrEqual(86460);
+    expect(before + ttl).toBeLessThanOrEqual(nextRun(after));
+    expect(after + ttl).toBeGreaterThanOrEqual(nextRun(before));
+  });
+
   it("lets Workers Caching keep the stats but never a reader's own numbers", async () => {
     const stats = await SELF.fetch('https://base.test/v1/stats', { headers: { 'CF-Connecting-IP': '198.51.100.50' } });
     expect(stats.headers.get('Cache-Control')).toMatch(/^public, max-age=\d+$/);
@@ -343,11 +386,71 @@ describe('caching', () => {
   });
 });
 
+describe('report receipts', () => {
+  it('deduplicates retries including retries after daily quota', async () => {
+    const { id } = await (await submit('198.51.100.80', '8181818181', 30)).json<{ id: string }>();
+    const report = (reportId: string) => SELF.fetch('https://base.test/v1/skips', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-TT-UID': '8282828282', 'CF-Connecting-IP': '198.51.100.81' },
+      body: JSON.stringify({ report_id: reportId, skips: [{ id, n: 2, ms: 2000 }] }),
+    });
+    const first = crypto.randomUUID();
+    expect((await report(first)).status).toBe(200);
+    expect((await report(crypto.randomUUID())).status).toBe(200);
+    expect((await report(first)).status).toBe(200);
+    await runDaily();
+    await runDaily();
+    const row = await env.DB.prepare('SELECT skips FROM segments WHERE id = ?').bind(id).first<{ skips: number }>();
+    expect(row?.skips).toBe(4);
+  });
+
+  it('clears old payloads while retaining a deduplication receipt', async () => {
+    await env.DB.prepare("INSERT INTO skip_reports(user_id, ip_hash, created_at, items, report_id) VALUES ('x', 'net', ?, '[]', ?)")
+      .bind(Math.floor(Date.now() / 1000) - 4 * 86400, crypto.randomUUID()).run();
+    await runDaily();
+    const row = await env.DB.prepare('SELECT items, report_id FROM skip_reports').first<{ items: string | null; report_id: string }>();
+    expect(row?.items).toBeNull();
+    expect(row?.report_id).toBeTruthy();
+  });
+});
+
 describe('snapshot', () => {
   it('answers 503 until the first build', async () => {
     const res = await SELF.fetch('https://base.test/v1/db.bin', { headers: { 'CF-Connecting-IP': '198.51.100.9' } });
     expect(res.status).toBe(503);
     expect(res.headers.get('Retry-After')).toBe('300');
+  });
+
+  it('publishes equal-sized multipart chunks and an exact count for a large base', async () => {
+    for (let start = 0; start < 450; start += 50) {
+      await env.DB.batch(Array.from({ length: 50 }, (_, i) => env.DB.prepare(
+        "INSERT INTO segments(id, num, user_id, name, duration_ms, frames, hash_count, hashes, times, created_at, updated_at) VALUES (?, ?, 'large', 'large', 2000, 62, ?, ?, ?, 1000, 1000)")
+        .bind(crypto.randomUUID(), start + i + 1, 4000 + i * 20,
+          new ArrayBuffer((4000 + i * 20) * 4), new ArrayBuffer((4000 + i * 20) * 4))));
+    }
+    const sizes: number[] = [];
+    let headerCount = 0;
+    const bucket = {
+      async createMultipartUpload() {
+        return {
+          async uploadPart(partNumber: number, bytes: Uint8Array) {
+            sizes[partNumber - 1] = bytes.byteLength;
+            if (partNumber === 1) headerCount = new DataView(bytes.buffer, bytes.byteOffset).getUint32(8, true);
+            return { partNumber, etag: String(partNumber) };
+          },
+          async complete(parts: R2UploadedPart[]) {
+            expect(parts.map(p => p.partNumber)).toEqual(sizes.map((_, i) => i + 1));
+          },
+          async abort() { throw new Error('Unexpected abort'); },
+        };
+      },
+    } as unknown as R2Bucket;
+    const ctx = createExecutionContext();
+    await worker.scheduled(createScheduledController({ scheduledTime: Date.now() }) as ScheduledController, { ...env, BUCKET: bucket }, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(headerCount).toBe(450);
+    expect(sizes.length).toBeGreaterThanOrEqual(3);
+    expect(sizes.slice(0, -1).every(size => size === 5 * 1024 * 1024)).toBe(true);
+    expect(sizes.at(-1)).toBeLessThanOrEqual(5 * 1024 * 1024);
   });
 
   it('serves the built snapshot with its segments', async () => {
@@ -358,6 +461,22 @@ describe('snapshot', () => {
     const bytes = new Uint8Array(await res.arrayBuffer());
     expect(new DataView(bytes.buffer).getUint32(8, true)).toBe(1);
     expect(bytes.byteLength).toBe(12 + 40 + 60 * 8);
+  });
+
+  it('advances across a full page of changes with identical timestamps', async () => {
+    const rows = Array.from({ length: 150 }, (_, i) => env.DB.prepare(
+      "INSERT INTO segments(id, num, user_id, name, duration_ms, frames, hash_count, hashes, times, created_at, updated_at) VALUES (?, ?, 'bulk', 'bulk', 2000, 62, 5000, ?, ?, 1000, 1000)")
+      .bind(crypto.randomUUID(), i + 1, new ArrayBuffer(20000), new ArrayBuffer(20000)));
+    await env.DB.batch(rows);
+    const first = await SELF.fetch('https://base.test/v1/db/since?t=1000');
+    expect(first.headers.get('X-Db-More')).toBe('1');
+    expect(first.headers.get('X-Db-Time')).toBe('1000');
+    const count1 = new DataView(await first.arrayBuffer()).getUint32(8, true);
+    const second = await SELF.fetch('https://base.test/v1/db/since?t=1000&after=' + first.headers.get('X-Db-Cursor'));
+    expect(second.headers.get('X-Db-More')).toBe('0');
+    // Replay the boundary hour instead of advancing past a concurrent same-second change.
+    expect(second.headers.get('X-Db-Time')).toBe('0');
+    expect(count1 + new DataView(await second.arrayBuffer()).getUint32(8, true)).toBe(150);
   });
 
   it('pages a delta by bytes, not by rows', async () => {

@@ -9,29 +9,29 @@ keyed the same way. Every limit is also counted per network address, kept only a
 an IPv6 client counts as its /64. Errors are JSON: `{"error": "message"}`.
 
 The public GETs (`/v1/db.bin`, `/v1/db/since`, `/v1/stats`) say `Cache-Control: public` and are
-answered by Workers Caching without running the Worker; everything else says `no-store`.
+answered from Workers Caching until a minute past the next daily run at 01:00 UTC, without running
+the Worker. A new deployment starts with an empty cache. Everything else says `no-store`.
 
 ## Reading
 
 ### `GET /v1/db.bin`
 
-Every visible segment, as a snapshot. It is rebuilt at 01:00 UTC each day and after a moderator's
-change, and cached until a minute past the next hourly run. Until the first build the reply is `503` with `Retry-After: 300`.
+Every visible segment, as a snapshot. It is rebuilt at 01:00 UTC each day and cached until a minute past the next daily run. Until the first build the reply is `503` with `Retry-After: 300`.
 `X-Db-Time` is the start of the hour the snapshot is current as of. 60 requests a minute per address.
 
 ### `GET /v1/db/since?t=EPOCH`
 
 Every segment changed at or after `t`, hidden ones included with the hidden flag set so phones
 drop them. A page holds at most 4 MB of data, about 100 segments at the largest size. `X-Db-Time` is the `t` to ask with next, and `X-Db-More: 1`
-says the page was full and the next one should be fetched now. Rows at the page boundary can
+says the page was full and the next one should be fetched now. Pass the returned `X-Db-Cursor` UUID as `after` together with `X-Db-Time` as `t`; persist both until the final page. This advances even when many changes share one second. Rows at the page boundary can
 arrive twice; apply them by id. A last page answers as of the start of the current hour, so phones
 ask with whole hours and most of their requests are answered from the cache; rows changed since
-that hour arrive again next time.
+that hour arrive again next time. A continuation conservatively returns its boundary hour on completion; updated clients also retain the first partial page's boundary hour until that pagination finishes, to replay concurrent changes behind a UUID cursor.
 
 ### `GET /v1/stats`
 
 `{"total", "active", "contributors", "votes_up", "votes_down", "skips", "saved_ms"}` for the
-whole base, counted at each hourly run that follows a change and cached until the next one.
+whole base, counted by daily maintenance at 01:00 UTC and cached until the next publication.
 
 ### `GET /v1/me` (needs `X-SB-Token`)
 
@@ -105,7 +105,7 @@ from another account on the same address is `409`. The reply is the new tally:
 
 ### `POST /v1/skips`
 
-`{"skips": [{"id": "<uuid>", "n": 3, "ms": 41000}]}`: how many times this phone skipped each
-shared segment since its last report and the time that saved. Twice a day per account. The counts reach the segments within the hour; a report covers at most 200 segments. A
+`{"report_id": "<uuid-v4>", "skips": [{"id": "<uuid>", "n": 3, "ms": 41000}]}`: how many times this phone skipped each
+shared segment since its last report and the time that saved. Updated clients send once per 24 hours; the server permits two reports per rolling day for old clients. Counts reach the segments at daily maintenance; a report covers at most 200 segments. A stable optional `report_id` is deduplicated per account for 30 days, including retries after the daily quota. Retry the exact payload/id, never reuse an id for different counts. Updated clients stop retrying an uncertain report after seven days (local lifetime totals remain). Legacy reports without an id cannot be deduplicated. A
 viewer's skips of their own segments count only towards `/v1/stats`, not towards `/v1/me`; `n` is capped at 500 and `ms` at `n` times
 the segment's length.

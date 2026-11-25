@@ -3,9 +3,8 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-11-01",
 
-  // Workers Caching answers the public GETs (stats, snapshot, deltas) from Cloudflare's cache
-  // without running the Worker, so they cost no D1 reads or R2 operations. Every other response
-  // says no-store. Cache hits still count towards the daily request limit.
+  // Enable public GET caching (stats, snapshot, deltas). Verify deployed hits and billing;
+  // configuration alone is not evidence of cache savings. Private responses say no-store.
   "cache": { "enabled": true },
   "account_id": "943ad1cd29711dec0741bbab64061011",
 
@@ -33,9 +32,8 @@
     { "name": "READ_LIMITER", "namespace_id": "1003", "simple": { "limit": 60, "period": 60 } }
   ],
 
-  // Hourly: merge queued skip counts and refresh the stats; the snapshot is rebuilt when a change
-  // flagged it, and every day at 01:00 UTC.
+  // Daily at 01:00 UTC: merge reports, refresh totals, clean up and publish the snapshot.
   "triggers": {
-    "crons": ["0 * * * *"]
+    "crons": ["0 1 * * *"]
   }
 }

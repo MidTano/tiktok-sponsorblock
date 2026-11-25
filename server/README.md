@@ -1,8 +1,8 @@
 # Server
 
 A Cloudflare Worker ([`src/index.ts`](src/index.ts)) with a D1 database for segments, votes and
-counters and an R2 bucket for the daily snapshot. It fits the Workers free plan: phones read a
-cached snapshot once a day and write rarely.
+counters and an R2 bucket for the daily snapshot. Designed for economical use on the Workers
+free plan: phones sync once a day and write rarely. Capacity depends on measured load.
 
 ## Running your own
 
@@ -82,30 +82,52 @@ What keeps a phone cheap:
 
 - **Workers Caching** (`"cache": { "enabled": true }` in `wrangler.jsonc`) answers
   `/v1/db.bin`, `/v1/db/since` and `/v1/stats` from Cloudflare's cache until a minute past the
-  next hourly run, without running the Worker, so they cost no D1 or R2 reads. A cache hit still
-  counts as a request.
+  next daily run at 01:00 UTC, without running the Worker, so a hit costs no D1 or R2 reads. A hit
+  still counts as a Worker request. Each deployment starts with an empty cache. Check it with
+  `curl -sI <url>` twice: the second answer says `cf-cache-status: HIT`.
 - **Whole-hour deltas.** A delta answers as of the start of the hour, so every phone asks with one
   of a few dozen `t` values and most deltas come from the cache.
 - **One row per skip report.** A report keeps its counts as JSON in one `skip_reports` row; the
-  hourly run adds them to the segments in a single statement.
-- **A quiet hourly run.** One query checks what changed. The stats are counted again only after a
-  change, and the retention cleanup and the snapshot run once a day, at 01:00 UTC.
-- **The phone asks rarely**: the base once a day, skip counts at most twice a day and only when it
-  skipped something, statistics at most once an hour and only when the list is open, in one
-  request (`/v1/me` carries the totals).
+  daily run adds them to the segments in a single statement.
+- **Daily maintenance**, at 01:00 UTC, merges reports, refreshes totals, clears old records and
+  publishes the snapshot. No hourly idle checks.
+- **The updated phone asks rarely**: the base once a day, skip counts once a day and only when it
+  skipped something, statistics once a day and only when the list is open, in one
+  request (`/v1/me` carries the totals). Pending votes send their latest value at daily sync;
+  local down-votes and undo apply immediately. A newly marked ad can upload immediately.
 
 A rough budget for one daily phone, as an estimate:
 
 | What the phone does | Requests | D1 rows written |
 | --- | --- | --- |
 | Daily sync | 1 | 0 |
-| Skip counts, up to twice a day | 2 | about 3 each, 3 more when cleared after 3 days |
-| Statistics, when the list is opened | 0 to a few | 0 |
+| Skip counts, once a day | 0–1 | report insertion, later merge and cleanup; depends on segments covered |
+| Statistics, when the list is opened | 0–1 | 0 |
 | Marking an ad or voting, now and then | 1 each | about 7 per mark, 6 per vote |
 
-That is about 4 requests and 12 rows written a day, so the free plan carries somewhere around
-8,000 to 20,000 daily users, with rows written running out first. Past that, the Workers Paid
-plan ($5 a month) lifts every limit above by a wide margin.
+Report insertion/cleanup is **not the whole cost**. The daily merge also
+writes every distinct segment touched by those reports, and statistics refreshes read the whole
+segments table. Two reports covering 200 different segments each can therefore cause roughly
+400 segment updates in addition to report storage and shared maintenance. Index maintenance adds
+cost when indexed columns change. There is no defensible fixed daily-user capacity without measurements.
+
+Measure Worker requests separately from D1 SQL queries, rows read and rows written. One phone
+request can execute several statements and read many rows; scheduled maintenance and manual
+exports also contribute even with one phone. The normal client budget is one daily download
+(possibly several delta pages), at most one nonempty report and one statistics fetch per day
+when the list is opened: normally up to three requests without submissions or pending votes.
+Submissions, queued votes and older installed clients add traffic. Automatic failed sync/statistics
+attempts wait 24 hours, including across restarts; concurrent statistics loads are coalesced.
+These client changes only take effect after installing a new build. The server still permits two
+reports per rolling day for compatibility with older clients; this is not the new client's interval.
+
+Never publicly cache `/v1/me`, writes, errors or anything keyed by a token, and do not add a
+blanket Cache Everything rule for the API.
+
+For scale: on 25 November 2026, with one phone on the old hourly schedule, the public instance
+used 75 Worker requests, 270 D1 queries, 3,173 rows read and 226 rows written in the day, which
+is under 0.3% of every free-plan daily limit. Most of it was the 24 hourly runs and the
+maintainer's own checks, not the phone.
 
 Watch the numbers under **Workers & Pages → your Worker → Metrics** and **D1 → your database →
 Metrics**. Your own `wrangler d1 execute` and `d1 export` runs count too: an export reads every
