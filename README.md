@@ -74,7 +74,7 @@ Adding sound-based ad skipping to your mod takes four hooks: the video's playbac
 a way to seek, the decoded audio of the current video, and an entry point for marking. The core
 library does the rest. Start with [docs/integrating.md](docs/integrating.md).
 
-You can use the public base at `https://metra-adskip.falker600.workers.dev` or run your own; the
+You can use the public base at `https://api.sponblocktikitoki.dpdns.org` or run your own; the
 API is in [docs/api.md](docs/api.md) and the deployment steps in
 [server/README.md](server/README.md). A shared base works better the more mods feed it, so
 using the public one is encouraged.

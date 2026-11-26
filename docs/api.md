@@ -1,6 +1,14 @@
 # Shared base API
 
-Base URL of the public instance: `https://metra-adskip.falker600.workers.dev`.
+Base URL of the public instance: `https://api.sponblocktikitoki.dpdns.org`. The same API answers on
+`https://metra-adskip.falker600.workers.dev` for older mod versions; new clients should use it only
+when the first address does not answer. The nightly snapshot is also served without the API at
+`https://cdn.sponblocktikitoki.dpdns.org/db.bin`; that copy has no `X-Db-Time`, so take the hour
+before its `Last-Modified` as the time it is current as of.
+
+On the public instance every call but `/v1/health` needs `X-SB-Token`, even a read, and a firewall
+in front of the Worker refuses unknown paths and methods and answers `429` above 15 requests in 10
+seconds from one address.
 
 Requests that write carry a sync token in `X-SB-Token`: 43 URL-safe characters that the phone creates once
 and keeps private. The server stores only a keyed hash of it, so a copy of the database names no
