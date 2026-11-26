@@ -8,7 +8,7 @@
  *   node scripts/admin.mjs list [--hidden]      newest 50 segments
  *   node scripts/admin.mjs show <num>           one segment and its votes
  *   node scripts/admin.mjs hide <num>           take a segment off every phone
- *   node scripts/admin.mjs unhide <num>
+ *   node scripts/admin.mjs unhide <num>         restore it; votes can no longer hide it
  *   node scripts/admin.mjs ban <num> [reason]   ban who sent ad<num>, hide all they sent
  *   node scripts/admin.mjs unban <num>          lift the ban on who sent ad<num>
  *   node scripts/admin.mjs pending              segments held for review
@@ -93,8 +93,9 @@ switch (command) {
   case 'unhide': {
     const n = number(arg);
     sql(command === 'hide'
-      ? "UPDATE segments SET hidden = 1, status = 'removed', updated_at = " + now() + ' WHERE num = ' + n
-      : "UPDATE segments SET hidden = 0, status = 'active', updated_at = " + now() + ' WHERE num = ' + n);
+      ? "UPDATE segments SET hidden = 1, pinned = 0, status = 'removed', updated_at = " + now() + ' WHERE num = ' + n
+      // A restored segment stays visible however it is voted on afterwards.
+      : "UPDATE segments SET hidden = 0, pinned = 1, status = 'active', updated_at = " + now() + ' WHERE num = ' + n);
     markSnapshotDirty();
     console.log((command === 'hide' ? 'Hid' : 'Restored') + ' ad' + n);
     break;

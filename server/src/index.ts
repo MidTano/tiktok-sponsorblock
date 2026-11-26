@@ -18,7 +18,7 @@
  *   GET  /v1/db.bin                 every visible segment, built into R2 when due
  *   GET  /v1/db/since?t=EPOCH       segments changed since then, hidden ones flagged
  *   POST /v1/segments               a new segment
- *   POST /v1/segments/:id/vote      +1 or -1, one per account and per network
+ *   POST /v1/segments/:id/vote      +1, -1 or 0, one per account and per network
  *   POST /v1/skips                  the day's skip counts from one phone
  */
 
@@ -29,6 +29,8 @@ export interface Env {
   SUBMIT_LIMITER: RateLimit;
   VOTE_LIMITER: RateLimit;
   READ_LIMITER: RateLimit;
+  /** Deltas a cache miss can force; a phone asks for at most ten pages a day. */
+  DELTA_LIMITER: RateLimit;
   /**
    * Salts the stored network hashes. It is a Worker secret (wrangler secret put IP_SALT): with a
    * public salt anyone holding a copy of the database could hash every IPv4 address and read
@@ -61,6 +63,10 @@ const SUBMITS_PER_IP_DAY = 60;
 const NEW_SEGMENTS_PER_DAY = 300;
 const VOTES_PER_UID_DAY = 300;
 const VOTES_PER_IP_DAY = 600;
+/** Down-votes one network keeps on segments in a day; two networks can hide a segment. */
+const DOWN_VOTES_PER_IP_DAY = 50;
+/** Changes one account may make to its vote on one segment in a day. */
+const MAX_VOTE_CHANGES = 4;
 const REPORTS_PER_DAY = 2;
 /** One report claims at most this many skips of one segment, each saving at most its length. */
 const MAX_REPORTED_SKIPS = 500;
@@ -69,7 +75,7 @@ const MAX_SUBMIT_BODY = 256 * 1024;
 const MAX_SMALL_BODY = 64 * 1024;
 
 /** A delta page scans at most DELTA_SCAN rows and returns as many as fit in DELTA_BYTES. */
-const DELTA_SCAN = 2_000;
+const DELTA_SCAN = 500;
 const DELTA_BYTES = 4 * 1024 * 1024;
 /** R2 multipart parts other than the last must be at least 5 MiB. */
 const SNAPSHOT_PART_BYTES = 5 * 1024 * 1024;
@@ -101,6 +107,14 @@ const VERSION = 2;
 
 const TT_UID_RE = /^[0-9]{5,30}$/;
 const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+/**
+ * Writes, votes and bans count an IPv6 client as its /48: free tunnel brokers hand out a /48, so
+ * a smaller prefix would give one person thousands of networks. Read bursts keep the /64, so
+ * phones on one mobile carrier do not share a read limit.
+ */
+const WRITE_V6_GROUPS = 3;
+const READ_V6_GROUPS = 4;
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 type SegmentRow = {
@@ -153,7 +167,10 @@ export default {
 async function route(req: Request, env: Env): Promise<Response> {
   if (!env.IP_SALT) return err(503, 'Server is not configured: IP_SALT secret is missing');
   if (!env.USER_SECRET) return err(503, 'Server is not configured: USER_SECRET secret is missing');
-  const path = new URL(req.url).pathname.replace(/\/$/, '');
+  const url = new URL(req.url);
+  const path = url.pathname;
+  // Every distinct URL is its own cache entry; extra query strings would only bypass the cache.
+  if (url.search && path !== '/v1/db/since') return err(400, 'No query parameters here');
   if (req.method === 'GET') {
     if (path === '/v1/health') return json({ ok: true });
     if (path === '/v1/stats') return handleStats(req, env);
@@ -171,7 +188,7 @@ async function route(req: Request, env: Env): Promise<Response> {
 }
 
 async function handleStats(req: Request, env: Env): Promise<Response> {
-  const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + clientNetwork(req) });
+  const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + clientNetwork(req, READ_V6_GROUPS) });
   if (!success) return err(429, 'Too many requests');
   const cached = await env.DB.prepare(
     "SELECT value, (SELECT value FROM meta WHERE key = 'stats_at') AS published FROM meta WHERE key = 'stats'",
@@ -184,7 +201,7 @@ async function handleStats(req: Request, env: Env): Promise<Response> {
 
 async function handleMe(req: Request, env: Env): Promise<Response> {
   const user = await userOf(req, env);
-  const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + clientNetwork(req) });
+  const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + clientNetwork(req, READ_V6_GROUPS) });
   if (!success) return err(429, 'Too many requests');
   // The base's totals ride along, so the statistics card needs one request instead of two.
   const row = await env.DB.prepare(
@@ -198,7 +215,7 @@ async function handleMe(req: Request, env: Env): Promise<Response> {
 }
 
 async function handleFullDb(req: Request, env: Env): Promise<Response> {
-  const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + clientNetwork(req) });
+  const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + clientNetwork(req, READ_V6_GROUPS) });
   if (!success) return err(429, 'Too many requests');
 
   const obj = await env.BUCKET.get('db.bin');
@@ -220,15 +237,19 @@ async function handleFullDb(req: Request, env: Env): Promise<Response> {
  * holds the segments, in order, that fit in DELTA_BYTES; the rest come with the next request.
  */
 async function handleDelta(req: Request, env: Env): Promise<Response> {
-  const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + clientNetwork(req) });
+  const { success } = await env.DELTA_LIMITER.limit({ key: 'ip:' + clientNetwork(req, READ_V6_GROUPS) });
   if (!success) return err(429, 'Too many requests');
 
   // Capture before querying: crossing an hour while reading must not advance past unseen changes.
   const startedAt = nowSec();
   const params = new URL(req.url).searchParams;
-  const since = Number(params.get('t') ?? '0');
+  const keys = [...params.keys()];
+  if (keys.some((key) => key !== 't' && key !== 'after') || new Set(keys).size !== keys.length)
+    return err(400, 'Only t and after');
+  const raw = params.get('t') ?? '0';
+  const since = Number(raw);
   const after = params.get('after') ?? '';
-  if (!Number.isSafeInteger(since) || since < 0) return err(400, 'Bad t');
+  if (!/^[0-9]{1,12}$/.test(raw) || !Number.isSafeInteger(since)) return err(400, 'Bad t');
   if (after && !UUID_RE.test(after)) return err(400, 'Bad cursor');
 
   const scan = (await env.DB.prepare(
@@ -269,21 +290,24 @@ async function handleDelta(req: Request, env: Env): Promise<Response> {
 
 async function handleSubmit(req: Request, env: Env): Promise<Response> {
   const user = await userOf(req, env);
-  const net = clientNetwork(req);
+  const net = clientNetwork(req, WRITE_V6_GROUPS);
   // Reject bursts before any D1 query, including the ban lookup.
   const { success } = await env.SUBMIT_LIMITER.limit({ key: 'ip:' + net });
   if (!success) return json({ queued: true }, 202);
-  const netHash = await hashNetwork(env, net);
-  if (await banned(env, user, netHash)) return err(403, 'Banned');
+
+  // Malformed bodies cost no D1 reads.
+  const body = await readJson<SubmitBody>(req, MAX_SUBMIT_BODY);
+  const invalid = validateSubmit(body);
+  if (invalid) return err(400, invalid);
+
+  const nets = await networkHashes(env, req);
+  const netHash = nets[0];
+  if (await banned(env, user, nets)) return err(403, 'Banned');
   const used = await countsToday(env, 'segments', user, netHash);
   if (used.byUid >= SUBMITS_PER_UID_DAY || used.byIp >= SUBMITS_PER_IP_DAY) return json({ queued: true }, 202);
   const day = await env.DB.prepare('SELECT COUNT(*) AS n FROM segments WHERE created_at > ?')
     .bind(nowSec() - DAY_SECONDS).first<{ n: number }>();
   if ((day?.n ?? 0) >= NEW_SEGMENTS_PER_DAY) return json({ queued: true }, 202);
-
-  const body = await readJson<SubmitBody>(req, MAX_SUBMIT_BODY);
-  const invalid = validateSubmit(body);
-  if (invalid) return err(400, invalid);
 
   let hashes: ArrayBuffer;
   let times: ArrayBuffer;
@@ -344,55 +368,87 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
   const user = await userOf(req, env);
   if (!UUID_RE.test(rawId)) return err(400, 'Invalid segment id');
   const segmentId = rawId.toLowerCase();
-  const net = clientNetwork(req);
+  const net = clientNetwork(req, WRITE_V6_GROUPS);
   const { success } = await env.VOTE_LIMITER.limit({ key: 'ip:' + net });
   if (!success) return err(429, 'Too many votes, slow down');
-  const netHash = await hashNetwork(env, net);
-  if (await banned(env, user, netHash)) return err(403, 'Banned');
-  const used = await countsToday(env, 'votes', user, netHash);
-  if (used.byUid >= VOTES_PER_UID_DAY || used.byIp >= VOTES_PER_IP_DAY) return err(429, 'Too many votes today');
 
   const body = await readJson<{ vote: number }>(req, MAX_SMALL_BODY);
   if (body.vote !== 1 && body.vote !== -1 && body.vote !== 0) return err(400, 'vote must be 1, -1, or 0 to take it back');
 
-  const segment = await env.DB.prepare("SELECT id, user_id, created_at FROM segments WHERE id = ? AND status = 'active'")
-    .bind(segmentId).first<{ id: string; user_id: string; created_at: number }>();
+  const nets = await networkHashes(env, req);
+  const netHash = nets[0];
+  if (await banned(env, user, nets)) return err(403, 'Banned');
+  const now = nowSec();
+  const since = now - DAY_SECONDS;
+  const day = Math.floor(now / DAY_SECONDS);
+  // Daily counters by primary key: a refused vote reads two rows and writes nothing, however many
+  // votes came before it.
+  const quota = (await env.DB.prepare('SELECT key, n, down FROM vote_quota WHERE key IN (?, ?) AND day = ?')
+    .bind('u:' + user, 'n:' + netHash, day).all<{ key: string; n: number; down: number }>()).results ?? [];
+  const byUser = quota.find((row) => row.key === 'u:' + user);
+  const byNet = quota.find((row) => row.key === 'n:' + netHash);
+  if ((byUser?.n ?? 0) >= VOTES_PER_UID_DAY || (byNet?.n ?? 0) >= VOTES_PER_IP_DAY) return err(429, 'Too many votes today');
+
+  const segment = await env.DB.prepare("SELECT id, user_id, pinned FROM segments WHERE id = ? AND status = 'active'")
+    .bind(segmentId).first<{ id: string; user_id: string; pinned: number }>();
   if (!segment) return err(404, 'Segment not found');
   if (segment.user_id === user) return err(409, 'You cannot vote on your own segment');
 
+  // A repeated vote stops at one primary-key read.
+  const existing = await env.DB.prepare('SELECT vote, changes, created_at FROM votes WHERE segment_id = ? AND user_id = ?')
+    .bind(segmentId, user).first<{ vote: number; changes: number; created_at: number }>();
+  if ((existing?.vote ?? 0) === body.vote) return json({ changed: false });
+
   // One vote per segment per account, and per network too, since an account id is only a claim.
   if (body.vote !== 0) {
+    // The partial index on active votes skips votes taken back.
     const fromNetwork = await env.DB.prepare(
-      'SELECT 1 AS found FROM votes WHERE segment_id = ? AND ip_hash = ? AND user_id != ? LIMIT 1',
-    ).bind(segmentId, netHash, user).first<{ found: number }>();
+      'SELECT 1 AS found FROM votes WHERE segment_id = ? AND ip_hash IN (?, ?) AND user_id != ? AND vote != 0 LIMIT 1',
+    ).bind(segmentId, netHash, nets[1] ?? netHash, user).first<{ found: number }>();
     if (fromNetwork) return err(409, 'This segment already has a vote from your network');
   }
 
-  const existing = await env.DB.prepare('SELECT vote FROM votes WHERE segment_id = ? AND user_id = ?')
-    .bind(segmentId, user).first<{ vote: number }>();
-  const now = nowSec();
-  if ((existing?.vote ?? 0) === body.vote) return json({ changed: false });
-  if (body.vote === 0) {
-    await env.DB.prepare('DELETE FROM votes WHERE segment_id = ? AND user_id = ?').bind(segmentId, user).run();
-  } else if (existing) {
-    await env.DB.prepare('UPDATE votes SET vote = ?, ip_hash = ? WHERE segment_id = ? AND user_id = ?')
-      .bind(body.vote, netHash, segmentId, user).run();
-  } else {
-    await env.DB.prepare('INSERT INTO votes (segment_id, user_id, ip_hash, vote, created_at) VALUES (?, ?, ?, ?, ?)')
-      .bind(segmentId, user, netHash, body.vote, now).run();
-  }
+  if (existing && existing.created_at > since && existing.changes >= MAX_VOTE_CHANGES)
+    return err(429, 'Too many changes to this vote today');
+  if (body.vote === -1 && (byNet?.down ?? 0) >= DOWN_VOTES_PER_IP_DAY) return err(429, 'Too many down-votes today');
+
+  // Compare and set: of two requests that read the same vote, only the first changes it. A vote
+  // taken back stays as 0, so its change count survives.
+  const write = existing
+    ? env.DB.prepare(
+        `UPDATE votes SET vote = ?1, ip_hash = ?2, created_at = ?3,
+                changes = CASE WHEN created_at > ?4 THEN changes + 1 ELSE 1 END
+         WHERE segment_id = ?5 AND user_id = ?6 AND vote = ?7 AND (created_at <= ?4 OR changes < ?8)`,
+      ).bind(body.vote, netHash, now, since, segmentId, user, existing.vote, MAX_VOTE_CHANGES)
+    : env.DB.prepare(
+        'INSERT INTO votes (segment_id, user_id, ip_hash, vote, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(segment_id, user_id) DO NOTHING',
+      ).bind(segmentId, user, netHash, body.vote, now);
+  // One transaction: the counters are charged only when the vote changed (changes() of the write).
+  const [written] = await env.DB.batch([
+    write,
+    env.DB.prepare(
+      `INSERT INTO vote_quota (key, day, n, down)
+         SELECT ?1, ?3, 1, ?4 WHERE changes() > 0 UNION ALL SELECT ?2, ?3, 1, ?4 WHERE changes() > 0
+       ON CONFLICT(key) DO UPDATE SET
+         n = CASE WHEN day = excluded.day THEN n + 1 ELSE 1 END,
+         down = CASE WHEN day = excluded.day THEN down + excluded.down ELSE excluded.down END,
+         day = excluded.day`,
+    ).bind('u:' + user, 'n:' + netHash, day, body.vote === -1 ? 1 : 0),
+  ]);
+  if (!written.meta.changes) return err(409, 'The vote changed at the same time, try again');
 
   const tally = await env.DB.prepare(
     `SELECT SUM(CASE WHEN vote = 1 THEN 1 ELSE 0 END) AS up,
             SUM(CASE WHEN vote = -1 THEN 1 ELSE 0 END) AS down
-     FROM votes WHERE segment_id = ?`,
+     FROM votes WHERE segment_id = ? AND vote != 0`,
   ).bind(segmentId).first<{ up: number | null; down: number | null }>();
   const up = tally?.up ?? 0;
   const down = tally?.down ?? 0;
   const score = up - down;
   const total = up + down;
   const confirmed = total >= 2 ? 1 : 0;
-  const hidden = score <= HIDE_SCORE ? 1 : 0;
+  // A segment the maintainer restored with admin.mjs unhide stays visible.
+  const hidden = !segment.pinned && score <= HIDE_SCORE ? 1 : 0;
 
   await env.DB.prepare(
     `UPDATE segments SET score = ?, votes_up = ?, votes_down = ?, confirmed = ?, hidden = ?, updated_at = ?
@@ -410,11 +466,12 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
 async function handleSkips(req: Request, env: Env): Promise<Response> {
   const user = await userOf(req, env);
   // Share the read burst budget; a broken client cannot keep querying D1 after its daily quota.
-  const net = clientNetwork(req);
+  const net = clientNetwork(req, WRITE_V6_GROUPS);
   const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + net });
   if (!success) return err(429, 'Too many requests');
-  const netHash = await hashNetwork(env, net);
-  if (await banned(env, user, netHash)) return err(403, 'Banned');
+  const nets = await networkHashes(env, req);
+  const netHash = nets[0];
+  if (await banned(env, user, nets)) return err(403, 'Banned');
 
   const body = await readJson<{ skips: SkipItem[]; report_id?: string }>(req, MAX_SMALL_BODY);
   if (body.report_id !== undefined && (typeof body.report_id !== 'string' || !UUID_RE.test(body.report_id)))
@@ -506,6 +563,7 @@ async function clearOldRecords(env: Env): Promise<void> {
     env.DB.prepare('UPDATE segments SET source_aid = NULL, ip_hash = NULL WHERE created_at < ? AND (source_aid IS NOT NULL OR ip_hash IS NOT NULL)')
       .bind(sourceCutoff),
     env.DB.prepare('UPDATE votes SET ip_hash = NULL WHERE created_at < ? AND ip_hash IS NOT NULL').bind(sourceCutoff),
+    env.DB.prepare('DELETE FROM vote_quota WHERE day < ?').bind(Math.floor(now / DAY_SECONDS)),
     // AUTOINCREMENT preserves the merge cursor even when the table becomes empty.
     // Never delete reports not yet merged (including arrivals during this maintenance run).
     env.DB.prepare("UPDATE skip_reports SET items = NULL WHERE created_at < ? AND items IS NOT NULL AND rowid <= COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'skips_merged'), 0)")
@@ -706,7 +764,7 @@ function validatePrint(hashes: ArrayBuffer, times: ArrayBuffer): string | null {
 }
 
 /** Rows this account and this network added to a table in the last 24 hours. */
-async function countsToday(env: Env, table: 'segments' | 'votes' | 'skip_reports', user: string, netHash: string) {
+async function countsToday(env: Env, table: 'segments' | 'skip_reports', user: string, netHash: string) {
   const since = nowSec() - DAY_SECONDS;
   const row = await env.DB.prepare(
     'SELECT (SELECT COUNT(*) FROM ' + table + ' WHERE user_id = ? AND created_at > ?) AS by_uid, ' +
@@ -716,11 +774,23 @@ async function countsToday(env: Env, table: 'segments' | 'votes' | 'skip_reports
 }
 
 /** Whether the maintainer banned this account or network with scripts/admin.mjs. */
-async function banned(env: Env, user: string, netHash: string): Promise<boolean> {
+async function banned(env: Env, user: string, nets: string[]): Promise<boolean> {
   const row = await env.DB.prepare(
-    "SELECT 1 AS found FROM bans WHERE (kind = 'user' AND value = ?) OR (kind = 'ip' AND value = ?) LIMIT 1",
-  ).bind(user, netHash).first<{ found: number }>();
+    "SELECT 1 AS found FROM bans WHERE (kind = 'user' AND value = ?) OR (kind = 'ip' AND value IN (?, ?)) LIMIT 1",
+  ).bind(user, nets[0], nets[1] ?? nets[0]).first<{ found: number }>();
   return row != null;
+}
+
+/**
+ * The keyed hash of the caller's write network, then for IPv6 the hash of its /64: rows and bans
+ * written before migration 0012 hold that one, so old bans and votes still match.
+ */
+async function networkHashes(env: Env, req: Request): Promise<string[]> {
+  const wide = clientNetwork(req, WRITE_V6_GROUPS);
+  const narrow = clientNetwork(req, READ_V6_GROUPS);
+  const hashes = [await hashNetwork(env, wide)];
+  if (narrow !== wide) hashes.push(await hashNetwork(env, narrow));
+  return hashes;
 }
 
 /**
@@ -772,18 +842,18 @@ function zeroNulls(row: Record<string, number | null> | null): Record<string, nu
 }
 
 /**
- * The network a request comes from: the address of an IPv4 client, or the first 64 bits of an
- * IPv6 one. A household or mobile carrier owns a whole /64, so counting single addresses would
- * let one customer rotate through unlimited quota.
+ * The network a request comes from: the address of an IPv4 client, or the first `groups` 16-bit
+ * groups of an IPv6 one. A household or mobile carrier owns at least a whole /64, so counting
+ * single addresses would let one customer rotate through unlimited quota.
  */
-function clientNetwork(req: Request): string {
+function clientNetwork(req: Request, groups: number): string {
   const ip = req.headers.get('CF-Connecting-IP') ?? 'unknown';
   if (!ip.includes(':')) return ip;
   const [head, tail = ''] = ip.split('::');
   const headGroups = head ? head.split(':') : [];
   const tailGroups = tail ? tail.split(':') : [];
   const fill = new Array(Math.max(0, 8 - headGroups.length - tailGroups.length)).fill('0');
-  return [...headGroups, ...fill, ...tailGroups].slice(0, 4).map((group) => group.padStart(4, '0')).join(':');
+  return [...headGroups, ...fill, ...tailGroups].slice(0, groups).map((group) => group.padStart(4, '0')).join(':');
 }
 
 async function hashNetwork(env: Env, net: string): Promise<string> {

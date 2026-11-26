@@ -6,7 +6,9 @@ Requests that write carry a sync token in `X-SB-Token`: 43 URL-safe characters t
 and keeps private. The server stores only a keyed hash of it, so a copy of the database names no
 account. Until 23 January 2027 the old `X-TT-UID` header (the TikTok account id) is still accepted and
 keyed the same way. Every limit is also counted per network address, kept only as a keyed hash;
-an IPv6 client counts as its /64. Errors are JSON: `{"error": "message"}`.
+an IPv6 client counts as its /48 for writes, votes and bans, and as its /64 for read bursts.
+Paths take no trailing slash, and only `/v1/db/since` takes a query string: any other query
+string, or an unknown or repeated parameter there, is `400`. Errors are JSON: `{"error": "message"}`.
 
 The public GETs (`/v1/db.bin`, `/v1/db/since`, `/v1/stats`) say `Cache-Control: public` and are
 answered from Workers Caching until a minute past the next daily run at 01:00 UTC, without running
@@ -27,6 +29,8 @@ says the page was full and the next one should be fetched now. Pass the returned
 arrive twice; apply them by id. A last page answers as of the start of the current hour, so phones
 ask with whole hours and most of their requests are answered from the cache; rows changed since
 that hour arrive again next time. A continuation conservatively returns its boundary hour on completion; A client should also keep the first partial page's boundary hour until that pagination finishes, to replay concurrent changes behind a UUID cursor.
+A page scans at most 500 changed segments. `t` is a non-negative whole number of seconds. Requests
+the cache cannot answer are limited to 10 a minute per address.
 
 ### `GET /v1/stats`
 
@@ -89,7 +93,7 @@ per segment:
 | `413` | body over 256 KB |
 | `415` | body not `application/json` |
 
-Limits: 5 a minute per address, 20 a day per account, 60 a day per address, 300 a day across the whole base. An IPv6 client counts as its /64 network. `source_aid` is
+Limits: 5 a minute per address, 20 a day per account, 60 a day per address, 300 a day across the whole base. An IPv6 client counts as its /48 network. `source_aid` is
 the TikTok video id the ad was cut from, used only by moderators to check a report; it is
 optional.
 
@@ -100,8 +104,12 @@ your own segment is `409`; a segment that is held or removed is `404`. A segment
 score, up-votes minus down-votes, reaches -2.
 Sending the other value changes it; sending the same one returns `{"changed": false}`. A vote
 from another account on the same address is `409`. The reply is the new tally:
-`{"score", "votes_up", "votes_down", "confirmed", "hidden"}`. Limits: 30 a minute per address,
-300 a day per account, 600 per address.
+`{"score", "votes_up", "votes_down", "confirmed", "hidden"}`. A segment the maintainer restored
+stays visible whatever its score. Limits: 30 a minute per address, 300 a day per account, 600
+per address; every change counts, taking a vote back with 0 included. One account changes its
+vote on one segment at most 4 times a day, and one address casts at most 50 down-votes a day. Vote
+limits reset at 00:00 UTC.
+Over a limit is `429`; keep the vote and send it another day.
 
 ### `POST /v1/skips`
 
