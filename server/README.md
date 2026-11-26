@@ -42,13 +42,16 @@ the top of `extensions/tiktok/src/main/java/app/morphe/extension/tiktok/adskip/S
 | What | Limit |
 | --- | --- |
 | Submissions | 5 a minute per address, 20 a day per account, 60 a day per address, 300 a day across the base |
-| Votes | 30 a minute per address, 300 a day per account, 600 a day per address |
-| Downloads | 60 a minute per address |
+| Votes | 30 a minute per address; 300 changes a day per account, 600 per address; 50 down-votes a day per address; 4 changes a day to one vote |
+| Downloads | 60 a minute per address; deltas the cache cannot answer, 10 a minute |
 | Skip reports | 2 a day per account |
 | A segment | 1 to 30 s, 40 to 6,000 hashes |
 
 Per-minute limits use Workers rate-limit bindings, which only take 10 or 60 second windows;
-daily limits are counted in D1.
+daily limits are counted in D1. An IPv6 client counts as its /48 for writes, votes and bans
+(free tunnel brokers hand out a whole /48) and as its /64 for read bursts.
+
+`admin.mjs unhide` pins a segment: votes no longer hide it until `hide` removes it.
 
 ## Moderation
 
@@ -123,6 +126,30 @@ the server still accepts two reports a day for them.
 
 Never publicly cache `/v1/me`, writes, errors or anything keyed by a token, and do not add a
 blanket Cache Everything rule for the API.
+
+## Protecting a public instance
+
+The limits in the Worker run only after the Worker starts, and on the free plan every started
+Worker counts towards the 100,000 requests a day, `429` answers included. One address at the
+per-minute read limit sends about 86,000 requests a day, so on `workers.dev` alone a single
+client can use up the day's quota and stop the base for everyone until 00:00 UTC.
+
+`workers.dev` has no WAF. A request that a WAF rule blocks never starts the Worker and costs
+nothing, so for a public instance:
+
+1. Add a domain to Cloudflare (Free plan) and serve the Worker on a Custom Domain, for example
+   `api.example.com`: add `"routes": [{ "pattern": "api.example.com", "custom_domain": true }]`
+   to `wrangler.jsonc`.
+2. Point the mods at the new address. When the old versions are gone, set `"workers_dev": false`
+   and `"preview_urls": false`, or the old address stays open around the WAF.
+3. Under **Security → WAF → Rate limiting rules** (one rule on Free), block by IP, for example:
+   `starts_with(http.request.uri.path, "/v1/")`, 20 requests per 10 seconds, block for 10 seconds.
+4. Under **Security → WAF → Custom rules** (five on Free), block what no phone sends:
+   - `not http.request.uri.path in {"/v1/health" "/v1/stats" "/v1/me" "/v1/db.bin" "/v1/db/since" "/v1/segments" "/v1/skips"} and not starts_with(http.request.uri.path, "/v1/segments/")`
+   - `http.request.method eq "POST" and not any(http.request.headers.names[*] eq "x-sb-token") and not any(http.request.headers.names[*] eq "x-tt-uid")`
+   - `http.request.uri.query ne "" and http.request.uri.path ne "/v1/db/since"`
+5. Do not turn on Bot Fight Mode or Under Attack Mode for this hostname: their browser challenges
+   stop phones.
 
 For scale: on 25 November 2026, with one phone on the old hourly schedule, the public instance
 used 75 Worker requests, 270 D1 queries, 3,173 rows read and 226 rows written in the day, which

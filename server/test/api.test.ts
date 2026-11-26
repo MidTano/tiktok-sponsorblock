@@ -108,17 +108,46 @@ describe('request limits', () => {
     expect(res.status).toBe(415);
   });
 
-  it('counts an IPv6 /64 as one network for votes', async () => {
+  it('counts an IPv6 /48 as one network for votes', async () => {
     const created = await submit('2001:db8:1:2:aaaa::1', '2222222222', 2);
     expect(created.status).toBe(201);
     const { id } = await created.json<{ id: string }>();
 
     expect((await vote('2001:db8:1:2:aaaa::2', '4444444441', id, -1)).status).toBe(200);
-    const sameNetwork = await vote('2001:db8:1:2:bbbb::9', '3333333333', id, -1);
+    // A tunnel broker's /48 holds 65,536 /64 networks; they all count as one.
+    const sameNetwork = await vote('2001:db8:1:ffff::9', '3333333333', id, -1);
     expect(sameNetwork.status).toBe(409);
 
-    const otherNetwork = await vote('2001:db8:1:3::9', '3333333333', id, -1);
+    const otherNetwork = await vote('2001:db8:2::9', '3333333333', id, -1);
     expect(otherNetwork.status).toBe(200);
+  });
+
+  it('refuses a malformed submission before querying D1', async () => {
+    let queries = 0;
+    const counted = { ...env, DB: { prepare() { queries++; throw new Error('D1 must not run'); } } as unknown as D1Database };
+    const response = await worker.fetch(new Request('https://base.test/v1/segments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-SB-Token': 'A'.repeat(43), 'CF-Connecting-IP': '198.51.100.90' },
+      body: JSON.stringify({ name: 'Ad', duration_ms: 99 }),
+    }), counted);
+    expect(response.status).toBe(400);
+    expect(queries).toBe(0);
+  });
+
+  it('uses the stricter delta limiter for /v1/db/since', async () => {
+    const limited = { ...env, DELTA_LIMITER: { limit: async () => ({ success: false }) } };
+    const delta = await worker.fetch(new Request('https://base.test/v1/db/since?t=3600'), limited);
+    expect(delta.status).toBe(429);
+  });
+
+  it('refuses query strings that would only bypass the cache', async () => {
+    expect((await SELF.fetch('https://base.test/v1/stats?x=1')).status).toBe(400);
+    expect((await SELF.fetch('https://base.test/v1/db.bin?x=1')).status).toBe(400);
+    expect((await SELF.fetch('https://base.test/v1/db/since?t=3600&x=1')).status).toBe(400);
+    expect((await SELF.fetch('https://base.test/v1/db/since?t=3600&t=7200')).status).toBe(400);
+    expect((await SELF.fetch('https://base.test/v1/db/since?t=-1')).status).toBe(400);
+    expect((await SELF.fetch('https://base.test/v1/db/since?t=1e3')).status).toBe(400);
+    expect((await SELF.fetch('https://base.test/v1/db/since?t=3600')).status).toBe(200);
   });
 
   it('queues a segment past the daily limit for the whole base', async () => {
@@ -267,6 +296,44 @@ describe('moderation', () => {
     await env.DB.prepare('UPDATE segments SET hidden = 1 WHERE id IN (?, ?)').bind(first.id, second.id).run();
     const held = await submit('198.51.100.39', '2121212121', 14);
     expect(await held.json<{ pending: boolean }>()).toMatchObject({ pending: true });
+  });
+
+  it('counts every change of a vote, including taking it back', async () => {
+    const { id } = await (await submit('198.51.100.50', '5050505050', 17)).json<{ id: string }>();
+    for (const value of [-1, 0, -1, 0]) expect((await vote('198.51.100.51', '5151515151', id, value)).status).toBe(200);
+    const row = await env.DB.prepare('SELECT vote, changes FROM votes WHERE segment_id = ?').bind(id).first();
+    expect(row).toMatchObject({ vote: 0, changes: 4 });
+    expect((await vote('198.51.100.51', '5151515151', id, 1)).status).toBe(429);
+  });
+
+  it('spends the daily vote limit on changes, not on rows', async () => {
+    const { id } = await (await submit('198.51.100.52', '5252525252', 18)).json<{ id: string }>();
+    expect((await vote('198.51.100.53', '5353535353', id, 1)).status).toBe(200);
+    // One row changed 300 times in the day is as much as 300 votes.
+    await env.DB.prepare('UPDATE votes SET changes = 300 WHERE segment_id = ?').bind(id).run();
+    const other = await (await submit('198.51.100.54', '5454545454', 19)).json<{ id: string }>();
+    expect((await vote('198.51.100.55', '5353535353', other.id, 1)).status).toBe(429);
+  });
+
+  it('limits how many segments one network down-votes in a day', async () => {
+    const { id } = await (await submit('198.51.100.56', '5656565656', 20)).json<{ id: string }>();
+    expect((await vote('198.51.100.57', '5757575757', id, -1)).status).toBe(200);
+    const { ip_hash } = (await env.DB.prepare('SELECT ip_hash FROM votes WHERE segment_id = ?').bind(id).first<{ ip_hash: string }>())!;
+    const now = Math.floor(Date.now() / 1000);
+    await env.DB.batch(Array.from({ length: 49 }, (_, i) => env.DB.prepare(
+      'INSERT INTO votes (segment_id, user_id, ip_hash, vote, created_at) VALUES (?, ?, ?, -1, ?)',
+    ).bind(crypto.randomUUID(), 'seed' + i, ip_hash, now)));
+    const next = await (await submit('198.51.100.58', '5858585858', 21)).json<{ id: string }>();
+    expect((await vote('198.51.100.57', '5959595959', next.id, -1)).status).toBe(429);
+    expect((await vote('198.51.100.57', '5959595959', next.id, 1)).status).toBe(200);
+  });
+
+  it('keeps a segment the maintainer restored visible whatever the votes', async () => {
+    const { id } = await (await submit('198.51.100.60', '6060606060', 22)).json<{ id: string }>();
+    await env.DB.prepare('UPDATE segments SET pinned = 1 WHERE id = ?').bind(id).run();
+    await vote('198.51.100.61', '6161616161', id, -1);
+    const second = await vote('198.51.100.62', '6262626262', id, -1);
+    expect(await second.json()).toMatchObject({ score: -2, hidden: 0 });
   });
 
   it('refuses votes on a segment the maintainer removed', async () => {
