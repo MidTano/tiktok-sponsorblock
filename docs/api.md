@@ -107,7 +107,8 @@ from another account on the same address is `409`. The reply is the new tally:
 `{"score", "votes_up", "votes_down", "confirmed", "hidden"}`. A segment the maintainer restored
 stays visible whatever its score. Limits: 30 a minute per address, 300 a day per account, 600
 per address; every change counts, taking a vote back with 0 included. One account changes its
-vote on one segment at most 4 times a day, and one address keeps at most 50 down-votes a day.
+vote on one segment at most 4 times a day, and one address casts at most 50 down-votes a day. Vote
+limits reset at 00:00 UTC.
 Over a limit is `429`; keep the vote and send it another day.
 
 ### `POST /v1/skips`

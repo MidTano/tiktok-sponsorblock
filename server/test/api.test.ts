@@ -9,6 +9,7 @@ beforeEach(async () => {
     env.DB.prepare("DELETE FROM meta WHERE key = 'skips_merged'"),
     env.DB.prepare('DELETE FROM skip_reports'),
     env.DB.prepare('DELETE FROM bans'),
+    env.DB.prepare('DELETE FROM vote_quota'),
     env.DB.prepare("UPDATE meta SET value = '1' WHERE key = 'snapshot_dirty'"),
     env.DB.prepare("DELETE FROM meta WHERE key = 'stats'"),
   ]);
@@ -309,20 +310,38 @@ describe('moderation', () => {
   it('spends the daily vote limit on changes, not on rows', async () => {
     const { id } = await (await submit('198.51.100.52', '5252525252', 18)).json<{ id: string }>();
     expect((await vote('198.51.100.53', '5353535353', id, 1)).status).toBe(200);
-    // One row changed 300 times in the day is as much as 300 votes.
-    await env.DB.prepare('UPDATE votes SET changes = 300 WHERE segment_id = ?').bind(id).run();
+    expect((await vote('198.51.100.53', '5353535353', id, 0)).status).toBe(200);
+    const counters = (await env.DB.prepare('SELECT key, n FROM vote_quota ORDER BY key').all<{ key: string; n: number }>()).results;
+    expect(counters.map((row) => row.n)).toEqual([2, 2]);
+    await env.DB.prepare("UPDATE vote_quota SET n = 300 WHERE key LIKE 'u:%'").run();
     const other = await (await submit('198.51.100.54', '5454545454', 19)).json<{ id: string }>();
     expect((await vote('198.51.100.55', '5353535353', other.id, 1)).status).toBe(429);
+  });
+
+  it('refuses a vote that lost a race instead of counting it twice', async () => {
+    const { id } = await (await submit('198.51.100.63', '6363636363', 23)).json<{ id: string }>();
+    const both = await Promise.all([vote('198.51.100.64', '6464646464', id, -1), vote('198.51.100.64', '6464646464', id, -1)]);
+    const statuses = both.map((res) => res.status).sort();
+    expect(statuses[0]).toBe(200);
+    const row = await env.DB.prepare('SELECT vote, changes FROM votes WHERE segment_id = ?').bind(id).first();
+    expect(row).toMatchObject({ vote: -1, changes: 1 });
+    expect(await env.DB.prepare('SELECT votes_down FROM segments WHERE id = ?').bind(id).first()).toMatchObject({ votes_down: 1 });
+  });
+
+  it('still applies a ban on an IPv6 /64 stored before the /48 change', async () => {
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode('test-salt'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode('2001:0db8:0009:0002'));
+    const legacy = [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 24);
+    await env.DB.prepare("INSERT INTO bans (kind, value, created_at) VALUES ('ip', ?, 0)").bind(legacy).run();
+    expect((await submit('2001:db8:9:2::5', '6565656565', 24)).status).toBe(403);
+    expect((await submit('2001:db8:9:3::5', '6565656565', 24)).status).toBe(201);
   });
 
   it('limits how many segments one network down-votes in a day', async () => {
     const { id } = await (await submit('198.51.100.56', '5656565656', 20)).json<{ id: string }>();
     expect((await vote('198.51.100.57', '5757575757', id, -1)).status).toBe(200);
-    const { ip_hash } = (await env.DB.prepare('SELECT ip_hash FROM votes WHERE segment_id = ?').bind(id).first<{ ip_hash: string }>())!;
-    const now = Math.floor(Date.now() / 1000);
-    await env.DB.batch(Array.from({ length: 49 }, (_, i) => env.DB.prepare(
-      'INSERT INTO votes (segment_id, user_id, ip_hash, vote, created_at) VALUES (?, ?, ?, -1, ?)',
-    ).bind(crypto.randomUUID(), 'seed' + i, ip_hash, now)));
+    expect(await env.DB.prepare("SELECT down FROM vote_quota WHERE key LIKE 'n:%'").first()).toMatchObject({ down: 1 });
+    await env.DB.prepare("UPDATE vote_quota SET down = 50 WHERE key LIKE 'n:%'").run();
     const next = await (await submit('198.51.100.58', '5858585858', 21)).json<{ id: string }>();
     expect((await vote('198.51.100.57', '5959595959', next.id, -1)).status).toBe(429);
     expect((await vote('198.51.100.57', '5959595959', next.id, 1)).status).toBe(200);

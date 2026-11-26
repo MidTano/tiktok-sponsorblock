@@ -300,8 +300,9 @@ async function handleSubmit(req: Request, env: Env): Promise<Response> {
   const invalid = validateSubmit(body);
   if (invalid) return err(400, invalid);
 
-  const netHash = await hashNetwork(env, net);
-  if (await banned(env, user, netHash)) return err(403, 'Banned');
+  const nets = await networkHashes(env, req);
+  const netHash = nets[0];
+  if (await banned(env, user, nets)) return err(403, 'Banned');
   const used = await countsToday(env, 'segments', user, netHash);
   if (used.byUid >= SUBMITS_PER_UID_DAY || used.byIp >= SUBMITS_PER_IP_DAY) return json({ queued: true }, 202);
   const day = await env.DB.prepare('SELECT COUNT(*) AS n FROM segments WHERE created_at > ?')
@@ -374,17 +375,19 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
   const body = await readJson<{ vote: number }>(req, MAX_SMALL_BODY);
   if (body.vote !== 1 && body.vote !== -1 && body.vote !== 0) return err(400, 'vote must be 1, -1, or 0 to take it back');
 
-  const netHash = await hashNetwork(env, net);
-  if (await banned(env, user, netHash)) return err(403, 'Banned');
+  const nets = await networkHashes(env, req);
+  const netHash = nets[0];
+  if (await banned(env, user, nets)) return err(403, 'Banned');
   const now = nowSec();
   const since = now - DAY_SECONDS;
-  // Every change counts, so switching a vote back and forth spends the daily limit as well.
-  const used = await env.DB.prepare(
-    `SELECT (SELECT COALESCE(SUM(changes), 0) FROM votes WHERE user_id = ?1 AND created_at > ?3) AS by_uid,
-            (SELECT COALESCE(SUM(changes), 0) FROM votes WHERE ip_hash = ?2 AND created_at > ?3) AS by_ip,
-            (SELECT COUNT(*) FROM votes WHERE ip_hash = ?2 AND created_at > ?3 AND vote = -1) AS down_by_ip`,
-  ).bind(user, netHash, since).first<{ by_uid: number; by_ip: number; down_by_ip: number }>();
-  if ((used?.by_uid ?? 0) >= VOTES_PER_UID_DAY || (used?.by_ip ?? 0) >= VOTES_PER_IP_DAY) return err(429, 'Too many votes today');
+  const day = Math.floor(now / DAY_SECONDS);
+  // Daily counters by primary key: a refused vote reads two rows and writes nothing, however many
+  // votes came before it.
+  const quota = (await env.DB.prepare('SELECT key, n, down FROM vote_quota WHERE key IN (?, ?) AND day = ?')
+    .bind('u:' + user, 'n:' + netHash, day).all<{ key: string; n: number; down: number }>()).results ?? [];
+  const byUser = quota.find((row) => row.key === 'u:' + user);
+  const byNet = quota.find((row) => row.key === 'n:' + netHash);
+  if ((byUser?.n ?? 0) >= VOTES_PER_UID_DAY || (byNet?.n ?? 0) >= VOTES_PER_IP_DAY) return err(429, 'Too many votes today');
 
   const segment = await env.DB.prepare("SELECT id, user_id, pinned FROM segments WHERE id = ? AND status = 'active'")
     .bind(segmentId).first<{ id: string; user_id: string; pinned: number }>();
@@ -394,25 +397,37 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
   // One vote per segment per account, and per network too, since an account id is only a claim.
   if (body.vote !== 0) {
     const fromNetwork = await env.DB.prepare(
-      'SELECT 1 AS found FROM votes WHERE segment_id = ? AND ip_hash = ? AND user_id != ? AND vote != 0 LIMIT 1',
-    ).bind(segmentId, netHash, user).first<{ found: number }>();
+      'SELECT 1 AS found FROM votes WHERE segment_id = ? AND ip_hash IN (?, ?) AND user_id != ? AND vote != 0 LIMIT 1',
+    ).bind(segmentId, netHash, nets[1] ?? netHash, user).first<{ found: number }>();
     if (fromNetwork) return err(409, 'This segment already has a vote from your network');
   }
 
   const existing = await env.DB.prepare('SELECT vote, changes, created_at FROM votes WHERE segment_id = ? AND user_id = ?')
     .bind(segmentId, user).first<{ vote: number; changes: number; created_at: number }>();
   if ((existing?.vote ?? 0) === body.vote) return json({ changed: false });
-  const recent = existing != null && existing.created_at > since;
-  if (existing && recent && existing.changes >= MAX_VOTE_CHANGES) return err(429, 'Too many changes to this vote today');
-  if (body.vote === -1 && (used?.down_by_ip ?? 0) >= DOWN_VOTES_PER_IP_DAY) return err(429, 'Too many down-votes today');
-  if (existing) {
-    // A vote taken back stays as 0, so taking it back and voting again still counts.
-    await env.DB.prepare('UPDATE votes SET vote = ?, ip_hash = ?, changes = ?, created_at = ? WHERE segment_id = ? AND user_id = ?')
-      .bind(body.vote, netHash, recent ? existing.changes + 1 : 1, now, segmentId, user).run();
-  } else {
-    await env.DB.prepare('INSERT INTO votes (segment_id, user_id, ip_hash, vote, created_at) VALUES (?, ?, ?, ?, ?)')
-      .bind(segmentId, user, netHash, body.vote, now).run();
-  }
+  if (existing && existing.created_at > since && existing.changes >= MAX_VOTE_CHANGES)
+    return err(429, 'Too many changes to this vote today');
+  if (body.vote === -1 && (byNet?.down ?? 0) >= DOWN_VOTES_PER_IP_DAY) return err(429, 'Too many down-votes today');
+
+  // Compare and set: of two requests that read the same vote, only the first changes it. A vote
+  // taken back stays as 0, so its change count survives.
+  const write = existing
+    ? await env.DB.prepare(
+        `UPDATE votes SET vote = ?1, ip_hash = ?2, created_at = ?3,
+                changes = CASE WHEN created_at > ?4 THEN changes + 1 ELSE 1 END
+         WHERE segment_id = ?5 AND user_id = ?6 AND vote = ?7 AND (created_at <= ?4 OR changes < ?8)`,
+      ).bind(body.vote, netHash, now, since, segmentId, user, existing.vote, MAX_VOTE_CHANGES).run()
+    : await env.DB.prepare(
+        'INSERT INTO votes (segment_id, user_id, ip_hash, vote, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(segment_id, user_id) DO NOTHING',
+      ).bind(segmentId, user, netHash, body.vote, now).run();
+  if (!write.meta.changes) return err(409, 'The vote changed at the same time, try again');
+  await env.DB.prepare(
+    `INSERT INTO vote_quota (key, day, n, down) VALUES (?1, ?3, 1, ?4), (?2, ?3, 1, ?4)
+     ON CONFLICT(key) DO UPDATE SET
+       n = CASE WHEN day = excluded.day THEN n + 1 ELSE 1 END,
+       down = CASE WHEN day = excluded.day THEN down + excluded.down ELSE excluded.down END,
+       day = excluded.day`,
+  ).bind('u:' + user, 'n:' + netHash, day, body.vote === -1 ? 1 : 0).run();
 
   const tally = await env.DB.prepare(
     `SELECT SUM(CASE WHEN vote = 1 THEN 1 ELSE 0 END) AS up,
@@ -446,8 +461,9 @@ async function handleSkips(req: Request, env: Env): Promise<Response> {
   const net = clientNetwork(req, WRITE_V6_GROUPS);
   const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + net });
   if (!success) return err(429, 'Too many requests');
-  const netHash = await hashNetwork(env, net);
-  if (await banned(env, user, netHash)) return err(403, 'Banned');
+  const nets = await networkHashes(env, req);
+  const netHash = nets[0];
+  if (await banned(env, user, nets)) return err(403, 'Banned');
 
   const body = await readJson<{ skips: SkipItem[]; report_id?: string }>(req, MAX_SMALL_BODY);
   if (body.report_id !== undefined && (typeof body.report_id !== 'string' || !UUID_RE.test(body.report_id)))
@@ -539,6 +555,7 @@ async function clearOldRecords(env: Env): Promise<void> {
     env.DB.prepare('UPDATE segments SET source_aid = NULL, ip_hash = NULL WHERE created_at < ? AND (source_aid IS NOT NULL OR ip_hash IS NOT NULL)')
       .bind(sourceCutoff),
     env.DB.prepare('UPDATE votes SET ip_hash = NULL WHERE created_at < ? AND ip_hash IS NOT NULL').bind(sourceCutoff),
+    env.DB.prepare('DELETE FROM vote_quota WHERE day < ?').bind(Math.floor(now / DAY_SECONDS)),
     // AUTOINCREMENT preserves the merge cursor even when the table becomes empty.
     // Never delete reports not yet merged (including arrivals during this maintenance run).
     env.DB.prepare("UPDATE skip_reports SET items = NULL WHERE created_at < ? AND items IS NOT NULL AND rowid <= COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'skips_merged'), 0)")
@@ -749,11 +766,23 @@ async function countsToday(env: Env, table: 'segments' | 'skip_reports', user: s
 }
 
 /** Whether the maintainer banned this account or network with scripts/admin.mjs. */
-async function banned(env: Env, user: string, netHash: string): Promise<boolean> {
+async function banned(env: Env, user: string, nets: string[]): Promise<boolean> {
   const row = await env.DB.prepare(
-    "SELECT 1 AS found FROM bans WHERE (kind = 'user' AND value = ?) OR (kind = 'ip' AND value = ?) LIMIT 1",
-  ).bind(user, netHash).first<{ found: number }>();
+    "SELECT 1 AS found FROM bans WHERE (kind = 'user' AND value = ?) OR (kind = 'ip' AND value IN (?, ?)) LIMIT 1",
+  ).bind(user, nets[0], nets[1] ?? nets[0]).first<{ found: number }>();
   return row != null;
+}
+
+/**
+ * The keyed hash of the caller's write network, then for IPv6 the hash of its /64: rows and bans
+ * written before migration 0012 hold that one, so old bans and votes still match.
+ */
+async function networkHashes(env: Env, req: Request): Promise<string[]> {
+  const wide = clientNetwork(req, WRITE_V6_GROUPS);
+  const narrow = clientNetwork(req, READ_V6_GROUPS);
+  const hashes = [await hashNetwork(env, wide)];
+  if (narrow !== wide) hashes.push(await hashNetwork(env, narrow));
+  return hashes;
 }
 
 /**

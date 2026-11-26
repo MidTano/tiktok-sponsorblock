@@ -42,7 +42,7 @@ the top of `extensions/tiktok/src/main/java/app/morphe/extension/tiktok/adskip/S
 | What | Limit |
 | --- | --- |
 | Submissions | 5 a minute per address, 20 a day per account, 60 a day per address, 300 a day across the base |
-| Votes | 30 a minute per address; 300 changes a day per account, 600 per address; 50 down-votes a day per address; 4 changes a day to one vote |
+| Votes | 30 a minute per address; 300 changes a UTC day per account, 600 per address; 50 down-votes a UTC day per address; 4 changes a day to one vote |
 | Downloads | 60 a minute per address; deltas the cache cannot answer, 10 a minute |
 | Skip reports | 2 a day per account |
 | A segment | 1 to 30 s, 40 to 6,000 hashes |
