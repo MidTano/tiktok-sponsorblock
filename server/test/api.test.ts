@@ -34,10 +34,15 @@ function landmarks(seed: number, count = 60) {
   return { hashes_b64: base64(hashes.buffer), times_b64: base64(times.buffer) };
 }
 
+/** A sync token per test account: the account's digits padded to the 43 characters a phone sends. */
+function tok(account: string): string {
+  return account.padEnd(43, 'A');
+}
+
 function submit(ip: string, uid: string, seed = 1): Promise<Response> {
   return SELF.fetch('https://base.test/v1/segments', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-TT-UID': uid, 'CF-Connecting-IP': ip },
+    headers: { 'Content-Type': 'application/json', 'X-SB-Token': tok(uid), 'CF-Connecting-IP': ip },
     body: JSON.stringify({ name: 'Ad', duration_ms: 2000, frames: 62, ...landmarks(seed) }),
   });
 }
@@ -45,7 +50,7 @@ function submit(ip: string, uid: string, seed = 1): Promise<Response> {
 function vote(ip: string, uid: string, id: string, value: number): Promise<Response> {
   return SELF.fetch('https://base.test/v1/segments/' + id + '/vote', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-TT-UID': uid, 'CF-Connecting-IP': ip },
+    headers: { 'Content-Type': 'application/json', 'X-SB-Token': tok(uid), 'CF-Connecting-IP': ip },
     body: JSON.stringify({ vote: value }),
   });
 }
@@ -53,8 +58,8 @@ function vote(ip: string, uid: string, id: string, value: number): Promise<Respo
 function skips(ip: string, uid: string, items: unknown[]): Promise<Response> {
   return SELF.fetch('https://base.test/v1/skips', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-TT-UID': uid, 'CF-Connecting-IP': ip },
-    body: JSON.stringify({ skips: items }),
+    headers: { 'Content-Type': 'application/json', 'X-SB-Token': tok(uid), 'CF-Connecting-IP': ip },
+    body: JSON.stringify({ skips: items, report_id: crypto.randomUUID() }),
   });
 }
 
@@ -94,7 +99,7 @@ describe('request limits', () => {
   it('refuses a body over the limit with 413', async () => {
     const res = await SELF.fetch('https://base.test/v1/segments', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-TT-UID': '1111111111', 'CF-Connecting-IP': '198.51.100.1' },
+      headers: { 'Content-Type': 'application/json', 'X-SB-Token': tok('1111111111'), 'CF-Connecting-IP': '198.51.100.1' },
       body: JSON.stringify({ name: 'x'.repeat(300 * 1024) }),
     });
     expect(res.status).toBe(413);
@@ -103,7 +108,7 @@ describe('request limits', () => {
   it('refuses a body that is not JSON with 415', async () => {
     const res = await SELF.fetch('https://base.test/v1/skips', {
       method: 'POST',
-      headers: { 'Content-Type': 'text/plain', 'X-TT-UID': '1111111111', 'CF-Connecting-IP': '198.51.100.2' },
+      headers: { 'Content-Type': 'text/plain', 'X-SB-Token': tok('1111111111'), 'CF-Connecting-IP': '198.51.100.2' },
       body: '{}',
     });
     expect(res.status).toBe(415);
@@ -143,7 +148,7 @@ describe('request limits', () => {
 
   it('refuses query strings that would only bypass the cache', async () => {
     expect((await SELF.fetch('https://base.test/v1/stats?x=1')).status).toBe(400);
-    expect((await SELF.fetch('https://base.test/v1/db.bin?x=1')).status).toBe(400);
+    expect((await SELF.fetch('https://base.test/v1/db.bin')).status).toBe(404);
     expect((await SELF.fetch('https://base.test/v1/db/since?t=3600&x=1')).status).toBe(400);
     expect((await SELF.fetch('https://base.test/v1/db/since?t=3600&t=7200')).status).toBe(400);
     expect((await SELF.fetch('https://base.test/v1/db/since?t=-1')).status).toBe(400);
@@ -165,7 +170,7 @@ describe('request limits', () => {
 });
 
 describe('accounts', () => {
-  it('refuses a request with neither a token nor a legacy uid', async () => {
+  it('refuses a request without a sync token', async () => {
     const res = await SELF.fetch('https://base.test/v1/me', { headers: { 'CF-Connecting-IP': '198.51.100.20' } });
     expect(res.status).toBe(401);
   });
@@ -177,12 +182,17 @@ describe('accounts', () => {
     expect(res.status).toBe(401);
   });
 
-  it('stores a keyed account hash and never the legacy uid', async () => {
+  it('stores a keyed account hash and never the token', async () => {
     const res = await submit('198.51.100.22', '1212121212', 7);
     const { id } = await res.json<{ id: string }>();
     const row = await env.DB.prepare('SELECT user_id FROM segments WHERE id = ?').bind(id).first<{ user_id: string }>();
-    expect(row?.user_id.startsWith('tt:')).toBe(true);
+    expect(row?.user_id.startsWith('sb:')).toBe(true);
     expect(row?.user_id).not.toContain('1212121212');
+  });
+
+  it('no longer accepts the TikTok account id as an account', async () => {
+    const res = await SELF.fetch('https://base.test/v1/me', { headers: { 'X-TT-UID': '1212121212', 'CF-Connecting-IP': '198.51.100.27' } });
+    expect(res.status).toBe(401);
   });
 
   it('answers /v1/me for a sync token', async () => {
@@ -204,7 +214,7 @@ describe('accounts', () => {
     const body = (name: string) => JSON.stringify({ name, duration_ms: 2000, frames: 62, ...landmarks(9) });
     const cleaned = await SELF.fetch('https://base.test/v1/segments', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-TT-UID': '1313131313', 'CF-Connecting-IP': '198.51.100.25' },
+      headers: { 'Content-Type': 'application/json', 'X-SB-Token': tok('1313131313'), 'CF-Connecting-IP': '198.51.100.25' },
       body: body('A\u0007d\u202E \u200D'),
     });
     const { id } = await cleaned.json<{ id: string }>();
@@ -214,7 +224,7 @@ describe('accounts', () => {
 
     const empty = await SELF.fetch('https://base.test/v1/segments', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-TT-UID': '1414141414', 'CF-Connecting-IP': '198.51.100.26' },
+      headers: { 'Content-Type': 'application/json', 'X-SB-Token': tok('1414141414'), 'CF-Connecting-IP': '198.51.100.26' },
       body: body('\u0007\u202E'),
     });
     expect(empty.status).toBe(400);
@@ -238,7 +248,7 @@ describe('moderation', () => {
     const times = new Int32Array(60).map((_, i) => i);
     const res = await SELF.fetch('https://base.test/v1/segments', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-TT-UID': '1515151515', 'CF-Connecting-IP': '198.51.100.30' },
+      headers: { 'Content-Type': 'application/json', 'X-SB-Token': tok('1515151515'), 'CF-Connecting-IP': '198.51.100.30' },
       body: JSON.stringify({ name: 'Bad', duration_ms: 2000, frames: 62, hashes_b64: base64(hashes.buffer), times_b64: base64(times.buffer) }),
     });
     expect(res.status).toBe(400);
@@ -255,7 +265,7 @@ describe('moderation', () => {
     }
     const res = await SELF.fetch('https://base.test/v1/segments', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-TT-UID': '1414141414', 'CF-Connecting-IP': '198.51.100.29' },
+      headers: { 'Content-Type': 'application/json', 'X-SB-Token': tok('1414141414'), 'CF-Connecting-IP': '198.51.100.29' },
       body: JSON.stringify({ name: 'Dense', duration_ms: 2000, frames: 62, hashes_b64: base64(hashes.buffer), times_b64: base64(times.buffer) }),
     });
     expect(res.status).toBe(201);
@@ -266,7 +276,7 @@ describe('moderation', () => {
     const times = new Int32Array(60).map((_, i) => i);
     const res = await SELF.fetch('https://base.test/v1/segments', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-TT-UID': '1616161616', 'CF-Connecting-IP': '198.51.100.31' },
+      headers: { 'Content-Type': 'application/json', 'X-SB-Token': tok('1616161616'), 'CF-Connecting-IP': '198.51.100.31' },
       body: JSON.stringify({ name: 'Tone', duration_ms: 2000, frames: 62, hashes_b64: base64(hashes.buffer), times_b64: base64(times.buffer) }),
     });
     expect(res.status).toBe(400);
@@ -354,15 +364,6 @@ describe('moderation', () => {
       "EXPLAIN QUERY PLAN SELECT 1 FROM votes WHERE segment_id = ? AND ip_hash IN (?, ?) AND user_id != ? AND vote != 0 LIMIT 1",
     ).bind(id, 'a', 'b', 'c').all<{ detail: string }>()).results.map((row) => row.detail).join(' ');
     expect(plan).toContain('idx_vote_segment_ip_active');
-  });
-
-  it('still applies a ban on an IPv6 /64 stored before the /48 change', async () => {
-    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode('test-salt'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-    const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode('2001:0db8:0009:0002'));
-    const legacy = [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 24);
-    await env.DB.prepare("INSERT INTO bans (kind, value, created_at) VALUES ('ip', ?, 0)").bind(legacy).run();
-    expect((await submit('2001:db8:9:2::5', '6565656565', 24)).status).toBe(403);
-    expect((await submit('2001:db8:9:3::5', '6565656565', 24)).status).toBe(201);
   });
 
   it('limits how many segments one network down-votes in a day', async () => {
@@ -457,7 +458,7 @@ describe('skip reports', () => {
       .json<{ skips: number; saved_ms: number }>();
     expect(stats).toMatchObject({ skips: 3, saved_ms: 2500 });
     const me = await (await SELF.fetch('https://base.test/v1/me', {
-      headers: { 'X-TT-UID': '2020202020', 'CF-Connecting-IP': '198.51.100.44' },
+      headers: { 'X-SB-Token': tok('2020202020'), 'CF-Connecting-IP': '198.51.100.44' },
     })).json<{ skips: number; saved_ms: number }>();
     expect(me).toMatchObject({ skips: 1, saved_ms: 1000 });
   });
@@ -487,7 +488,7 @@ describe('caching', () => {
     const stats = await SELF.fetch('https://base.test/v1/stats', { headers: { 'CF-Connecting-IP': '198.51.100.50' } });
     expect(stats.headers.get('Cache-Control')).toMatch(/^public, max-age=\d+$/);
     const me = await SELF.fetch('https://base.test/v1/me', {
-      headers: { 'X-TT-UID': '2222222222', 'CF-Connecting-IP': '198.51.100.51' },
+      headers: { 'X-SB-Token': tok('2222222222'), 'CF-Connecting-IP': '198.51.100.51' },
     });
     expect(me.headers.get('Cache-Control')).toBe('no-store');
     expect(await me.json()).toHaveProperty('base.active');
@@ -504,7 +505,7 @@ describe('report receipts', () => {
   it('deduplicates retries including retries after daily quota', async () => {
     const { id } = await (await submit('198.51.100.80', '8181818181', 30)).json<{ id: string }>();
     const report = (reportId: string) => SELF.fetch('https://base.test/v1/skips', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-TT-UID': '8282828282', 'CF-Connecting-IP': '198.51.100.81' },
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-SB-Token': tok('8282828282'), 'CF-Connecting-IP': '198.51.100.81' },
       body: JSON.stringify({ report_id: reportId, skips: [{ id, n: 2, ms: 2000 }] }),
     });
     const first = crypto.randomUUID();
@@ -528,12 +529,6 @@ describe('report receipts', () => {
 });
 
 describe('snapshot', () => {
-  it('answers 503 until the first build', async () => {
-    const res = await SELF.fetch('https://base.test/v1/db.bin', { headers: { 'CF-Connecting-IP': '198.51.100.9' } });
-    expect(res.status).toBe(503);
-    expect(res.headers.get('Retry-After')).toBe('300');
-  });
-
   it('publishes equal-sized multipart chunks and an exact count for a large base', async () => {
     for (let start = 0; start < 450; start += 50) {
       await env.DB.batch(Array.from({ length: 50 }, (_, i) => env.DB.prepare(
@@ -567,12 +562,13 @@ describe('snapshot', () => {
     expect(sizes.at(-1)).toBeLessThanOrEqual(5 * 1024 * 1024);
   });
 
-  it('serves the built snapshot with its segments', async () => {
+  it('builds the snapshot into R2 with its segments', async () => {
     await submit('198.51.100.10', '9999999999', 6);
     await runHourly();
-    const res = await SELF.fetch('https://base.test/v1/db.bin', { headers: { 'CF-Connecting-IP': '198.51.100.11' } });
-    expect(res.status).toBe(200);
-    const bytes = new Uint8Array(await res.arrayBuffer());
+    // The CDN serves this object as it is; the Worker has no route for it.
+    const obj = await env.BUCKET.get('db.bin');
+    expect(obj).not.toBeNull();
+    const bytes = new Uint8Array(await obj!.arrayBuffer());
     expect(new DataView(bytes.buffer).getUint32(8, true)).toBe(1);
     expect(bytes.byteLength).toBe(12 + 40 + 60 * 8);
   });

@@ -12,8 +12,7 @@ free plan: phones sync once a day and write rarely. Capacity depends on measured
    npx wrangler d1 create <db-name>
    npx wrangler r2 bucket create <bucket-name>
    ```
-3. In [`wrangler.jsonc`](wrangler.jsonc) set `name` (it becomes the `workers.dev` host),
-   `account_id`, `database_name`, `database_id` and `bucket_name`. The rate-limit
+3. In [`wrangler.jsonc`](wrangler.jsonc) set `name`, the custom domain in `routes`, `account_id`, `database_name`, `database_id` and `bucket_name`. The rate-limit
    `namespace_id` values only need to be unique within your account.
 4. Apply the migrations, in order:
    ```sh
@@ -33,8 +32,8 @@ For local development, `npx wrangler dev` with a `.dev.vars` file holding `IP_SA
 
 ## Pointing a mod at your server
 
-Every mod keeps the server address in its own code; point it at your
-`https://<name>.<subdomain>.workers.dev` and build the mod again. In Metra it is `BASE_URL` near
+Every mod keeps the server address in its own code; point it at your `https://api.<zone>` and
+`https://cdn.<zone>/db.bin` and build the mod again. In Metra they are `BASE_URL` and `SNAPSHOT_URL` near
 the top of `extensions/tiktok/src/main/java/app/morphe/extension/tiktok/adskip/SharedDb.java`.
 
 ## Limits
@@ -84,7 +83,7 @@ skipping with what they have and send their counts later.
 What keeps a phone cheap:
 
 - **Workers Caching** (`"cache": { "enabled": true }` in `wrangler.jsonc`) answers
-  `/v1/db.bin`, `/v1/db/since` and `/v1/stats` from Cloudflare's cache until a minute past the
+  `/v1/db/since` and `/v1/stats` from Cloudflare's cache until a minute past the
   next daily run at 01:00 UTC, without running the Worker, so a hit costs no D1 or R2 reads. A hit
   still counts as a Worker request. Each deployment starts with an empty cache. Check it with
   `curl -sI <url>` twice: the second answer says `cf-cache-status: HIT`.
@@ -131,10 +130,10 @@ blanket Cache Everything rule for the API.
 
 The limits in the Worker run only after the Worker starts, and on the free plan every started
 Worker counts towards the 100,000 requests a day, `429` answers included. One address at the
-per-minute read limit sends about 86,000 requests a day, so on `workers.dev` alone a single
-client can use up the day's quota and stop the base for everyone until 00:00 UTC.
+per-minute read limit sends about 86,000 requests a day, so without a firewall a single client can
+use up the day's quota and stop the base for everyone until 00:00 UTC.
 
-`workers.dev` has no WAF. A request that a WAF rule blocks never starts the Worker and costs
+`workers.dev` has no WAF, so it is off (`"workers_dev": false`). A request that a WAF rule blocks never starts the Worker and costs
 nothing. The public instance is set up like this, all on the Free plan:
 
 ```mermaid
@@ -153,15 +152,13 @@ flowchart LR
 4. **Security → WAF → Custom rules** (four of the five on Free), all **Block**:
    - `not http.host in {"api.<zone>" "cdn.<zone>"}`
    - `http.host eq "api.<zone>" and http.request.uri.path ne "/v1/health" and not any(len(http.request.headers["x-sb-token"][*])[*] eq 43)`
-   - `http.host eq "api.<zone>" and not ((http.request.method in {"GET" "HEAD"} and http.request.uri.path in {"/v1/health" "/v1/stats" "/v1/me" "/v1/db.bin" "/v1/db/since"}) or (http.request.method eq "POST" and (http.request.uri.path in {"/v1/segments" "/v1/skips"} or (starts_with(http.request.uri.path, "/v1/segments/") and ends_with(http.request.uri.path, "/vote"))))) or (http.host eq "api.<zone>" and http.request.uri.query ne "" and http.request.uri.path ne "/v1/db/since")`
+   - `http.host eq "api.<zone>" and not ((http.request.method in {"GET" "HEAD"} and http.request.uri.path in {"/v1/health" "/v1/stats" "/v1/me" "/v1/db/since"}) or (http.request.method eq "POST" and (http.request.uri.path in {"/v1/segments" "/v1/skips"} or (starts_with(http.request.uri.path, "/v1/segments/") and ends_with(http.request.uri.path, "/vote"))))) or (http.host eq "api.<zone>" and http.request.uri.query ne "" and http.request.uri.path ne "/v1/db/since")`
    - `http.host eq "cdn.<zone>" and (http.request.uri.path ne "/db.bin" or http.request.uri.query ne "" or not http.request.method in {"GET" "HEAD"})`
 5. **Security → WAF → Rate limiting rules** (the one rule on Free): `http.host eq "api.<zone>"`,
    by IP and data center, 15 requests per 10 seconds, block for 10 seconds.
 6. Zone settings: SSL Full (strict), Always Use HTTPS, minimum TLS 1.2, Security Level
    essentially off and Browser Integrity Check off. Do not turn on Bot Fight Mode or Under Attack
    Mode: their browser challenges stop phones.
-7. When no mod version uses `workers.dev` any more, set `"workers_dev": false` and
-   `"preview_urls": false`; until then that address stays open around the WAF.
 
 What this does not stop: a slow flood from many addresses that looks like real phones still starts
 the Worker and can use up the day's 100,000 requests. Phones then still get the snapshot from the
