@@ -12,3 +12,7 @@ CREATE TABLE IF NOT EXISTS vote_quota (
 ALTER TABLE votes ADD COLUMN changes INTEGER NOT NULL DEFAULT 1;
 -- A segment the maintainer restored with admin.mjs unhide stays visible whatever the votes say.
 ALTER TABLE segments ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+-- Votes taken back stay as rows, so the per-network check and the tally use an index of active
+-- votes only; the old index over every vote is no longer needed.
+DROP INDEX IF EXISTS idx_vote_segment_ip;
+CREATE INDEX IF NOT EXISTS idx_vote_segment_ip_active ON votes(segment_id, ip_hash) WHERE vote != 0;

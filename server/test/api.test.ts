@@ -326,6 +326,34 @@ describe('moderation', () => {
     const row = await env.DB.prepare('SELECT vote, changes FROM votes WHERE segment_id = ?').bind(id).first();
     expect(row).toMatchObject({ vote: -1, changes: 1 });
     expect(await env.DB.prepare('SELECT votes_down FROM segments WHERE id = ?').bind(id).first()).toMatchObject({ votes_down: 1 });
+    // Only the request that changed the vote is charged.
+    const counters = (await env.DB.prepare('SELECT n FROM vote_quota').all<{ n: number }>()).results;
+    expect(counters.map((row) => row.n)).toEqual([1, 1]);
+  });
+
+  it('charges the counters only when the vote write changed a row', async () => {
+    await env.DB.prepare("INSERT INTO votes (segment_id, user_id, ip_hash, vote, created_at) VALUES ('s', 'u', 'h', 1, 0)").run();
+    // The same statements the Worker batches, with a compare-and-set that no longer matches.
+    await env.DB.batch([
+      env.DB.prepare("UPDATE votes SET vote = -1 WHERE segment_id = 's' AND user_id = 'u' AND vote = 0"),
+      env.DB.prepare("INSERT INTO vote_quota (key, day, n, down) SELECT 'u:u', 1, 1, 0 WHERE changes() > 0 UNION ALL SELECT 'n:h', 1, 1, 0 WHERE changes() > 0"),
+    ]);
+    expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM vote_quota').first<{ n: number }>())!.n).toBe(0);
+    await env.DB.batch([
+      env.DB.prepare("UPDATE votes SET vote = -1 WHERE segment_id = 's' AND user_id = 'u' AND vote = 1"),
+      env.DB.prepare("INSERT INTO vote_quota (key, day, n, down) SELECT 'u:u', 1, 1, 0 WHERE changes() > 0 UNION ALL SELECT 'n:h', 1, 1, 0 WHERE changes() > 0"),
+    ]);
+    expect((await env.DB.prepare('SELECT COUNT(*) AS n FROM vote_quota').first<{ n: number }>())!.n).toBe(2);
+  });
+
+  it('answers a repeated vote without the per-network lookup', async () => {
+    const { id } = await (await submit('198.51.100.66', '6666666661', 25)).json<{ id: string }>();
+    expect((await vote('198.51.100.67', '6767676767', id, 1)).status).toBe(200);
+    expect(await (await vote('198.51.100.67', '6767676767', id, 1)).json()).toMatchObject({ changed: false });
+    const plan = (await env.DB.prepare(
+      "EXPLAIN QUERY PLAN SELECT 1 FROM votes WHERE segment_id = ? AND ip_hash IN (?, ?) AND user_id != ? AND vote != 0 LIMIT 1",
+    ).bind(id, 'a', 'b', 'c').all<{ detail: string }>()).results.map((row) => row.detail).join(' ');
+    expect(plan).toContain('idx_vote_segment_ip_active');
   });
 
   it('still applies a ban on an IPv6 /64 stored before the /48 change', async () => {

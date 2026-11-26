@@ -394,17 +394,20 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
   if (!segment) return err(404, 'Segment not found');
   if (segment.user_id === user) return err(409, 'You cannot vote on your own segment');
 
+  // A repeated vote stops at one primary-key read.
+  const existing = await env.DB.prepare('SELECT vote, changes, created_at FROM votes WHERE segment_id = ? AND user_id = ?')
+    .bind(segmentId, user).first<{ vote: number; changes: number; created_at: number }>();
+  if ((existing?.vote ?? 0) === body.vote) return json({ changed: false });
+
   // One vote per segment per account, and per network too, since an account id is only a claim.
   if (body.vote !== 0) {
+    // The partial index on active votes skips votes taken back.
     const fromNetwork = await env.DB.prepare(
       'SELECT 1 AS found FROM votes WHERE segment_id = ? AND ip_hash IN (?, ?) AND user_id != ? AND vote != 0 LIMIT 1',
     ).bind(segmentId, netHash, nets[1] ?? netHash, user).first<{ found: number }>();
     if (fromNetwork) return err(409, 'This segment already has a vote from your network');
   }
 
-  const existing = await env.DB.prepare('SELECT vote, changes, created_at FROM votes WHERE segment_id = ? AND user_id = ?')
-    .bind(segmentId, user).first<{ vote: number; changes: number; created_at: number }>();
-  if ((existing?.vote ?? 0) === body.vote) return json({ changed: false });
   if (existing && existing.created_at > since && existing.changes >= MAX_VOTE_CHANGES)
     return err(429, 'Too many changes to this vote today');
   if (body.vote === -1 && (byNet?.down ?? 0) >= DOWN_VOTES_PER_IP_DAY) return err(429, 'Too many down-votes today');
@@ -412,27 +415,32 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
   // Compare and set: of two requests that read the same vote, only the first changes it. A vote
   // taken back stays as 0, so its change count survives.
   const write = existing
-    ? await env.DB.prepare(
+    ? env.DB.prepare(
         `UPDATE votes SET vote = ?1, ip_hash = ?2, created_at = ?3,
                 changes = CASE WHEN created_at > ?4 THEN changes + 1 ELSE 1 END
          WHERE segment_id = ?5 AND user_id = ?6 AND vote = ?7 AND (created_at <= ?4 OR changes < ?8)`,
-      ).bind(body.vote, netHash, now, since, segmentId, user, existing.vote, MAX_VOTE_CHANGES).run()
-    : await env.DB.prepare(
+      ).bind(body.vote, netHash, now, since, segmentId, user, existing.vote, MAX_VOTE_CHANGES)
+    : env.DB.prepare(
         'INSERT INTO votes (segment_id, user_id, ip_hash, vote, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(segment_id, user_id) DO NOTHING',
-      ).bind(segmentId, user, netHash, body.vote, now).run();
-  if (!write.meta.changes) return err(409, 'The vote changed at the same time, try again');
-  await env.DB.prepare(
-    `INSERT INTO vote_quota (key, day, n, down) VALUES (?1, ?3, 1, ?4), (?2, ?3, 1, ?4)
-     ON CONFLICT(key) DO UPDATE SET
-       n = CASE WHEN day = excluded.day THEN n + 1 ELSE 1 END,
-       down = CASE WHEN day = excluded.day THEN down + excluded.down ELSE excluded.down END,
-       day = excluded.day`,
-  ).bind('u:' + user, 'n:' + netHash, day, body.vote === -1 ? 1 : 0).run();
+      ).bind(segmentId, user, netHash, body.vote, now);
+  // One transaction: the counters are charged only when the vote changed (changes() of the write).
+  const [written] = await env.DB.batch([
+    write,
+    env.DB.prepare(
+      `INSERT INTO vote_quota (key, day, n, down)
+         SELECT ?1, ?3, 1, ?4 WHERE changes() > 0 UNION ALL SELECT ?2, ?3, 1, ?4 WHERE changes() > 0
+       ON CONFLICT(key) DO UPDATE SET
+         n = CASE WHEN day = excluded.day THEN n + 1 ELSE 1 END,
+         down = CASE WHEN day = excluded.day THEN down + excluded.down ELSE excluded.down END,
+         day = excluded.day`,
+    ).bind('u:' + user, 'n:' + netHash, day, body.vote === -1 ? 1 : 0),
+  ]);
+  if (!written.meta.changes) return err(409, 'The vote changed at the same time, try again');
 
   const tally = await env.DB.prepare(
     `SELECT SUM(CASE WHEN vote = 1 THEN 1 ELSE 0 END) AS up,
             SUM(CASE WHEN vote = -1 THEN 1 ELSE 0 END) AS down
-     FROM votes WHERE segment_id = ?`,
+     FROM votes WHERE segment_id = ? AND vote != 0`,
   ).bind(segmentId).first<{ up: number | null; down: number | null }>();
   const up = tally?.up ?? 0;
   const down = tally?.down ?? 0;
