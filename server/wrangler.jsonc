@@ -1,11 +1,10 @@
 {
   "name": "metra-adskip",
   "main": "src/index.ts",
-  // The public API, behind the zone's WAF and rate limiting rule (see README). workers.dev stays on
-  // for mod versions that still use it; turn it off with "workers_dev": false once they are gone.
+  // The public API, only behind the zone's WAF and rate limiting rule (see README). workers.dev
+  // has no WAF, so it stays off.
   "routes": [{ "pattern": "api.sponblocktikitoki.dpdns.org", "custom_domain": true }],
-  // Must be explicit: with routes set, wrangler turns workers.dev off by default.
-  "workers_dev": true,
+  "workers_dev": false,
   "preview_urls": false,
   "compatibility_date": "2026-11-01",
 

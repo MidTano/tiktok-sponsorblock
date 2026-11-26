@@ -1,33 +1,32 @@
 # Shared base API
 
-Base URL of the public instance: `https://api.sponblocktikitoki.dpdns.org`. The same API answers on
-`https://metra-adskip.falker600.workers.dev` for older mod versions; new clients should use it only
-when the first address does not answer. The nightly snapshot is also served without the API at
-`https://cdn.sponblocktikitoki.dpdns.org/db.bin`; that copy has no `X-Db-Time`, so take the hour
-before its `Last-Modified` as the time it is current as of.
+Base URL of the public instance: `https://api.sponblocktikitoki.dpdns.org`. The nightly snapshot
+is not part of the API: it is served from storage at `https://cdn.sponblocktikitoki.dpdns.org/db.bin`.
 
 On the public instance every call but `/v1/health` needs `X-SB-Token`, even a read, and a firewall
 in front of the Worker refuses unknown paths and methods and answers `429` above 15 requests in 10
 seconds from one address.
 
-Requests that write carry a sync token in `X-SB-Token`: 43 URL-safe characters that the phone creates once
+Requests carry a sync token in `X-SB-Token`: 43 URL-safe characters that the phone creates once
 and keeps private. The server stores only a keyed hash of it, so a copy of the database names no
-account. Until 23 January 2027 the old `X-TT-UID` header (the TikTok account id) is still accepted and
-keyed the same way. Every limit is also counted per network address, kept only as a keyed hash;
+account. Every limit is also counted per network address, kept only as a keyed hash;
 an IPv6 client counts as its /48 for writes, votes and bans, and as its /64 for read bursts.
 Paths take no trailing slash, and only `/v1/db/since` takes a query string: any other query
 string, or an unknown or repeated parameter there, is `400`. Errors are JSON: `{"error": "message"}`.
 
-The public GETs (`/v1/db.bin`, `/v1/db/since`, `/v1/stats`) say `Cache-Control: public` and are
+The public GETs (`/v1/db/since`, `/v1/stats`) say `Cache-Control: public` and are
 answered from Workers Caching until a minute past the next daily run at 01:00 UTC, without running
 the Worker. A new deployment starts with an empty cache. Everything else says `no-store`.
 
 ## Reading
 
-### `GET /v1/db.bin`
+### `GET https://cdn.sponblocktikitoki.dpdns.org/db.bin`
 
-Every visible segment, as a snapshot. It is rebuilt at 01:00 UTC each day and cached until a minute past the next daily run. Until the first build the reply is `503` with `Retry-After: 300`.
-`X-Db-Time` is the start of the hour the snapshot is current as of. 60 requests a minute per address.
+Every visible segment, as a snapshot, served from R2 through the CDN without the Worker. It is
+rebuilt at 01:00 UTC each day; the CDN may serve the previous one for up to two hours after.
+Until the first build the reply is `404`. Ask the first delta with `t` set to the start of the hour
+before its `Last-Modified`: the snapshot is current as of the start of the hour its build began,
+and asking for an extra hour of changes is harmless.
 
 ### `GET /v1/db/since?t=EPOCH`
 
@@ -122,6 +121,6 @@ Over a limit is `429`; keep the vote and send it another day.
 ### `POST /v1/skips`
 
 `{"report_id": "<uuid-v4>", "skips": [{"id": "<uuid>", "n": 3, "ms": 41000}]}`: how many times this phone skipped each
-shared segment since its last report and the time that saved. Send at most one a day; the server accepts two per rolling day so older clients keep working. Counts reach the segments at daily maintenance; a report covers at most 200 segments. A stable optional `report_id` is deduplicated per account for 30 days, including retries after the daily quota. Retry the exact payload/id, never reuse an id for different counts. Stop retrying an unanswered report after seven days, well inside the 30-day receipt window. Legacy reports without an id cannot be deduplicated. A
+shared segment since its last report and the time that saved. Send at most one a day; the server accepts two per rolling day, so a report sent a little early still lands. Counts reach the segments at daily maintenance; a report covers at most 200 segments. The required `report_id` is deduplicated per account for 30 days, including retries after the daily quota. Retry the exact payload/id, never reuse an id for different counts. Stop retrying an unanswered report after seven days, well inside the 30-day receipt window. A
 viewer's skips of their own segments count only towards `/v1/stats`, not towards `/v1/me`; `n` is capped at 500 and `ms` at `n` times
 the segment's length.

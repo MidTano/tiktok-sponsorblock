@@ -7,7 +7,8 @@
  * SponsorBlock for TikTok: the shared ad base.
  *
  * Phones send the audio landmarks of ads they cut, vote on each other's cuts, download the
- * whole base once a day and report how often they skipped each ad. A phone identifies itself
+ * whole base once a day and report how often they skipped each ad. The nightly snapshot is
+ * built into R2 and served from there through the CDN, not by this Worker. A phone identifies itself
  * with a random sync token; the base keeps only a keyed hash of it, never the token. Addresses
  * are kept only as keyed hashes for the daily limits.
  *
@@ -15,7 +16,6 @@
  *   GET  /v1/health                 liveness
  *   GET  /v1/stats                  totals for the whole base
  *   GET  /v1/me                     the caller's segments and what they saved others
- *   GET  /v1/db.bin                 every visible segment, built into R2 when due
  *   GET  /v1/db/since?t=EPOCH       segments changed since then, hidden ones flagged
  *   POST /v1/segments               a new segment
  *   POST /v1/segments/:id/vote      +1, -1 or 0, one per account and per network
@@ -85,12 +85,6 @@ const SNAPSHOT_PAGE = 200;
 const SOURCE_RETENTION_SECONDS = 30 * DAY_SECONDS;
 const REPORT_RETENTION_SECONDS = 3 * DAY_SECONDS;
 
-/**
- * Until this instant the old X-TT-UID header is still accepted. It is keyed like a token, so the
- * account id is never stored, and the header stops working after it.
- */
-const LEGACY_UID_UNTIL = Date.UTC(2027, 0, 23);
-
 /** Landmarks run at 8 kHz with a 256-sample hop and at most 30 peaks a second, 6 pairs each. */
 const FRAMES_PER_SECOND = 8000 / 256;
 const MAX_HASHES_PER_SECOND = 30 * 6;
@@ -105,7 +99,6 @@ const SNAPSHOT_FORMAT = '2';
 const MAGIC = 0x4244414d; // "MADB"
 const VERSION = 2;
 
-const TT_UID_RE = /^[0-9]{5,30}$/;
 const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 /**
  * Writes, votes and bans count an IPv6 client as its /48: free tunnel brokers hand out a /48, so
@@ -175,7 +168,6 @@ async function route(req: Request, env: Env): Promise<Response> {
     if (path === '/v1/health') return json({ ok: true });
     if (path === '/v1/stats') return handleStats(req, env);
     if (path === '/v1/me') return handleMe(req, env);
-    if (path === '/v1/db.bin') return handleFullDb(req, env);
     if (path === '/v1/db/since') return handleDelta(req, env);
   }
   if (req.method === 'POST') {
@@ -212,24 +204,6 @@ async function handleMe(req: Request, env: Env): Promise<Response> {
   ).bind(user).first<Record<string, number | null> & { base: string | null }>();
   const { base, ...mine } = row ?? { base: null };
   return json({ ...zeroNulls(mine), base: base ? JSON.parse(base) : await refreshStats(env) });
-}
-
-async function handleFullDb(req: Request, env: Env): Promise<Response> {
-  const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + clientNetwork(req, READ_V6_GROUPS) });
-  if (!success) return err(429, 'Too many requests');
-
-  const obj = await env.BUCKET.get('db.bin');
-  if (!obj || obj.customMetadata?.format !== SNAPSHOT_FORMAT) {
-    return json({ error: 'The snapshot is not ready yet, try again later' }, 503, { 'Retry-After': '300' });
-  }
-  return new Response(obj.body, {
-    headers: {
-      'Content-Type': 'application/octet-stream',
-      'Cache-Control': untilNextRun(Math.floor(obj.uploaded.getTime() / 1000)),
-      'Last-Modified': obj.uploaded.toUTCString(),
-      'X-Db-Time': obj.customMetadata?.as_of ?? String(Math.floor(obj.uploaded.getTime() / 1000)),
-    },
-  });
 }
 
 /**
@@ -300,9 +274,8 @@ async function handleSubmit(req: Request, env: Env): Promise<Response> {
   const invalid = validateSubmit(body);
   if (invalid) return err(400, invalid);
 
-  const nets = await networkHashes(env, req);
-  const netHash = nets[0];
-  if (await banned(env, user, nets)) return err(403, 'Banned');
+  const netHash = await hashNetwork(env, net);
+  if (await banned(env, user, netHash)) return err(403, 'Banned');
   const used = await countsToday(env, 'segments', user, netHash);
   if (used.byUid >= SUBMITS_PER_UID_DAY || used.byIp >= SUBMITS_PER_IP_DAY) return json({ queued: true }, 202);
   const day = await env.DB.prepare('SELECT COUNT(*) AS n FROM segments WHERE created_at > ?')
@@ -375,9 +348,8 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
   const body = await readJson<{ vote: number }>(req, MAX_SMALL_BODY);
   if (body.vote !== 1 && body.vote !== -1 && body.vote !== 0) return err(400, 'vote must be 1, -1, or 0 to take it back');
 
-  const nets = await networkHashes(env, req);
-  const netHash = nets[0];
-  if (await banned(env, user, nets)) return err(403, 'Banned');
+  const netHash = await hashNetwork(env, net);
+  if (await banned(env, user, netHash)) return err(403, 'Banned');
   const now = nowSec();
   const since = now - DAY_SECONDS;
   const day = Math.floor(now / DAY_SECONDS);
@@ -403,8 +375,8 @@ async function handleVote(req: Request, env: Env, rawId: string): Promise<Respon
   if (body.vote !== 0) {
     // The partial index on active votes skips votes taken back.
     const fromNetwork = await env.DB.prepare(
-      'SELECT 1 AS found FROM votes WHERE segment_id = ? AND ip_hash IN (?, ?) AND user_id != ? AND vote != 0 LIMIT 1',
-    ).bind(segmentId, netHash, nets[1] ?? netHash, user).first<{ found: number }>();
+      'SELECT 1 AS found FROM votes WHERE segment_id = ? AND ip_hash = ? AND user_id != ? AND vote != 0 LIMIT 1',
+    ).bind(segmentId, netHash, user).first<{ found: number }>();
     if (fromNetwork) return err(409, 'This segment already has a vote from your network');
   }
 
@@ -469,19 +441,15 @@ async function handleSkips(req: Request, env: Env): Promise<Response> {
   const net = clientNetwork(req, WRITE_V6_GROUPS);
   const { success } = await env.READ_LIMITER.limit({ key: 'ip:' + net });
   if (!success) return err(429, 'Too many requests');
-  const nets = await networkHashes(env, req);
-  const netHash = nets[0];
-  if (await banned(env, user, nets)) return err(403, 'Banned');
+  const netHash = await hashNetwork(env, net);
+  if (await banned(env, user, netHash)) return err(403, 'Banned');
 
-  const body = await readJson<{ skips: SkipItem[]; report_id?: string }>(req, MAX_SMALL_BODY);
-  if (body.report_id !== undefined && (typeof body.report_id !== 'string' || !UUID_RE.test(body.report_id)))
-    return err(400, 'Bad report_id');
-  const reportId = body.report_id?.toLowerCase();
-  if (reportId) {
-    const duplicate = await env.DB.prepare('SELECT 1 AS found FROM skip_reports WHERE user_id = ? AND report_id = ?')
-      .bind(user, reportId).first();
-    if (duplicate) return json({ ok: true, duplicate: true });
-  }
+  const body = await readJson<{ skips: SkipItem[]; report_id: string }>(req, MAX_SMALL_BODY);
+  if (typeof body.report_id !== 'string' || !UUID_RE.test(body.report_id)) return err(400, 'Bad report_id');
+  const reportId = body.report_id.toLowerCase();
+  const duplicate = await env.DB.prepare('SELECT 1 AS found FROM skip_reports WHERE user_id = ? AND report_id = ?')
+    .bind(user, reportId).first();
+  if (duplicate) return json({ ok: true, duplicate: true });
   const reports = await countsToday(env, 'skip_reports', user, netHash);
   if (reports.byUid >= REPORTS_PER_DAY || reports.byIp >= REPORTS_PER_DAY * 5) return err(429, 'Already reported today');
   if (!Array.isArray(body.skips)) return err(400, 'skips must be a list');
@@ -499,7 +467,7 @@ async function handleSkips(req: Request, env: Env): Promise<Response> {
 
   const items = [...merged.values()].filter((item) => item.n > 0);
   await env.DB.prepare('INSERT INTO skip_reports (user_id, ip_hash, created_at, items, report_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, report_id) DO NOTHING')
-    .bind(user, netHash, nowSec(), JSON.stringify(items), reportId ?? null).run();
+    .bind(user, netHash, nowSec(), JSON.stringify(items), reportId).run();
   return json({ ok: true });
 }
 
@@ -774,40 +742,19 @@ async function countsToday(env: Env, table: 'segments' | 'skip_reports', user: s
 }
 
 /** Whether the maintainer banned this account or network with scripts/admin.mjs. */
-async function banned(env: Env, user: string, nets: string[]): Promise<boolean> {
+async function banned(env: Env, user: string, netHash: string): Promise<boolean> {
   const row = await env.DB.prepare(
-    "SELECT 1 AS found FROM bans WHERE (kind = 'user' AND value = ?) OR (kind = 'ip' AND value IN (?, ?)) LIMIT 1",
-  ).bind(user, nets[0], nets[1] ?? nets[0]).first<{ found: number }>();
+    "SELECT 1 AS found FROM bans WHERE (kind = 'user' AND value = ?) OR (kind = 'ip' AND value = ?) LIMIT 1",
+  ).bind(user, netHash).first<{ found: number }>();
   return row != null;
 }
 
-/**
- * The keyed hash of the caller's write network, then for IPv6 the hash of its /64: rows and bans
- * written before migration 0012 hold that one, so old bans and votes still match.
- */
-async function networkHashes(env: Env, req: Request): Promise<string[]> {
-  const wide = clientNetwork(req, WRITE_V6_GROUPS);
-  const narrow = clientNetwork(req, READ_V6_GROUPS);
-  const hashes = [await hashNetwork(env, wide)];
-  if (narrow !== wide) hashes.push(await hashNetwork(env, narrow));
-  return hashes;
-}
-
-/**
- * The account a request acts for: a keyed hash of the sync token the phone keeps, or until
- * LEGACY_UID_UNTIL, of the TikTok account id it still sends. Either way only the hash is used.
- */
+/** The account a request acts for: a keyed hash of the sync token the phone keeps. */
 async function userOf(req: Request, env: Env): Promise<string> {
   const token = req.headers.get('X-SB-Token')?.trim();
-  if (token) {
-    if (!TOKEN_RE.test(token)) throw new HttpError(401, 'The sync token is not valid');
-    return 'sb:' + (await hmacHex(env.USER_SECRET, token)).slice(0, 32);
-  }
-  const uid = req.headers.get('X-TT-UID')?.trim();
-  if (uid && TT_UID_RE.test(uid) && Date.now() < LEGACY_UID_UNTIL) {
-    return 'tt:' + (await hmacHex(env.USER_SECRET, uid)).slice(0, 32);
-  }
-  throw new HttpError(401, 'Provide your sync token in X-SB-Token');
+  if (!token) throw new HttpError(401, 'Provide your sync token in X-SB-Token');
+  if (!TOKEN_RE.test(token)) throw new HttpError(401, 'The sync token is not valid');
+  return 'sb:' + (await hmacHex(env.USER_SECRET, token)).slice(0, 32);
 }
 
 async function readJson<T>(req: Request, limit: number): Promise<T> {

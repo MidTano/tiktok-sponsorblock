@@ -11,7 +11,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * The shared base's binary format, the body of {@code GET /v1/db.bin} and
+ * The shared base's binary format, the body of the CDN's {@code db.bin} and
  * {@code GET /v1/db/since}. Little-endian:
  * <pre>
  *   [4] magic "MADB" (0x4244414D)   [4] version 2   [4] segment count
