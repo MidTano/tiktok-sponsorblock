@@ -135,21 +135,37 @@ per-minute read limit sends about 86,000 requests a day, so on `workers.dev` alo
 client can use up the day's quota and stop the base for everyone until 00:00 UTC.
 
 `workers.dev` has no WAF. A request that a WAF rule blocks never starts the Worker and costs
-nothing, so for a public instance:
+nothing. The public instance is set up like this, all on the Free plan:
 
-1. Add a domain to Cloudflare (Free plan) and serve the Worker on a Custom Domain, for example
-   `api.example.com`: add `"routes": [{ "pattern": "api.example.com", "custom_domain": true }]`
-   to `wrangler.jsonc`.
-2. Point the mods at the new address. When the old versions are gone, set `"workers_dev": false`
-   and `"preview_urls": false`, or the old address stays open around the WAF.
-3. Under **Security → WAF → Rate limiting rules** (one rule on Free), block by IP, for example:
-   `starts_with(http.request.uri.path, "/v1/")`, 20 requests per 10 seconds, block for 10 seconds.
-4. Under **Security → WAF → Custom rules** (five on Free), block what no phone sends:
-   - `not http.request.uri.path in {"/v1/health" "/v1/stats" "/v1/me" "/v1/db.bin" "/v1/db/since" "/v1/segments" "/v1/skips"} and not starts_with(http.request.uri.path, "/v1/segments/")`
-   - `http.request.method eq "POST" and not any(http.request.headers.names[*] eq "x-sb-token") and not any(http.request.headers.names[*] eq "x-tt-uid")`
-   - `http.request.uri.query ne "" and http.request.uri.path ne "/v1/db/since"`
-5. Do not turn on Bot Fight Mode or Under Attack Mode for this hostname: their browser challenges
-   stop phones.
+```mermaid
+flowchart LR
+  P["Phone"] --> W{"Zone WAF and<br/>rate limiting rule"}
+  W -- "anything else" --> B["403 / 429,<br/>Worker not started"]
+  W -- "cdn host, GET /db.bin" --> C["R2 via CDN,<br/>no Worker"]
+  W -- "api host, known routes" --> K["Worker + D1"]
+```
+
+1. A free domain (`sponblocktikitoki.dpdns.org`, DigitalPlat) is a Cloudflare zone on the Free plan.
+2. The Worker is a Custom Domain on `api.<zone>` (`routes` in `wrangler.jsonc`).
+3. The R2 bucket is a Custom Domain on `cdn.<zone>`, with a Cache Rule that keeps it at the edge
+   for 2 hours. Phones take the full snapshot from there, so the base still reaches them on a
+   day the Worker is over its quota.
+4. **Security → WAF → Custom rules** (four of the five on Free), all **Block**:
+   - `not http.host in {"api.<zone>" "cdn.<zone>"}`
+   - `http.host eq "api.<zone>" and http.request.uri.path ne "/v1/health" and not any(len(http.request.headers["x-sb-token"][*])[*] eq 43)`
+   - `http.host eq "api.<zone>" and not ((http.request.method in {"GET" "HEAD"} and http.request.uri.path in {"/v1/health" "/v1/stats" "/v1/me" "/v1/db.bin" "/v1/db/since"}) or (http.request.method eq "POST" and (http.request.uri.path in {"/v1/segments" "/v1/skips"} or (starts_with(http.request.uri.path, "/v1/segments/") and ends_with(http.request.uri.path, "/vote"))))) or (http.host eq "api.<zone>" and http.request.uri.query ne "" and http.request.uri.path ne "/v1/db/since")`
+   - `http.host eq "cdn.<zone>" and (http.request.uri.path ne "/db.bin" or http.request.uri.query ne "" or not http.request.method in {"GET" "HEAD"})`
+5. **Security → WAF → Rate limiting rules** (the one rule on Free): `http.host eq "api.<zone>"`,
+   by IP and data center, 15 requests per 10 seconds, block for 10 seconds.
+6. Zone settings: SSL Full (strict), Always Use HTTPS, minimum TLS 1.2, Security Level
+   essentially off and Browser Integrity Check off. Do not turn on Bot Fight Mode or Under Attack
+   Mode: their browser challenges stop phones.
+7. When no mod version uses `workers.dev` any more, set `"workers_dev": false` and
+   `"preview_urls": false`; until then that address stays open around the WAF.
+
+What this does not stop: a slow flood from many addresses that looks like real phones still starts
+the Worker and can use up the day's 100,000 requests. Phones then still get the snapshot from the
+CDN; only sending marks, votes and the statistics card wait for 00:00 UTC.
 
 For scale: on 25 November 2026, with one phone on the old hourly schedule, the public instance
 used 75 Worker requests, 270 D1 queries, 3,173 rows read and 226 rows written in the day, which
